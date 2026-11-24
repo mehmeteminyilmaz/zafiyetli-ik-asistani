@@ -273,12 +273,15 @@ async def security_headers_middleware(request: Request, call_next: Any) -> Respo
 
 
 class ChatRequest(BaseModel):
-    """Sohbet uç noktası istek şeması (geçmiş istemciden alınmaz, `session_id` ile sunucuda tutulur)."""
+    """Sohbet uç noktası istek şeması.
+
+    Güvenlik notu: `history` ve `enable_input_guard` istemciden KABUL EDİLMEZ;
+    oturum geçmişi ve girdi kalkanı durumu yalnızca sunucu tarafından kontrol edilir.
+    """
 
     message: str = Field(..., min_length=1, max_length=1000)
     mode: Literal["vulnerable", "secure"] = "vulnerable"
     session_id: str | None = Field(default=None, max_length=64)
-    enable_input_guard: bool = True
 
     @field_validator("message")
     @classmethod
@@ -321,14 +324,20 @@ def _has_proxy_headers(request: Request) -> bool:
 
 
 def _effective_client_ip(request: Request) -> str:
-    """Hız sınırlaması için istemci IP'sini belirler (`TRUST_PROXY_HEADERS=true` ise XFF ilk IP)."""
+    """Hız sınırlaması için istemci IP'sini belirler.
+
+    `TRUST_PROXY_HEADERS=true` olduğunda `X-Forwarded-For` zincirinin en solundaki (istemcinin
+    kolayca sahteleyebileceği) değer DEĞİL, `TRUSTED_PROXY_COUNT` sayısına göre sağdan
+    güvenilir vekil sunucunun eklediği IP okunur.
+    """
     cfg = load_settings()
     if cfg.trust_proxy_headers:
         xff = request.headers.get("x-forwarded-for", "")
         if xff:
-            first_ip = xff.split(",")[0].strip()
-            if first_ip:
-                return first_ip
+            chain = [ip.strip() for ip in xff.split(",") if ip.strip()]
+            if chain:
+                idx = max(0, len(chain) - cfg.trusted_proxy_count)
+                return chain[idx]
         real_ip = request.headers.get("x-real-ip", "").strip()
         if real_ip:
             return real_ip
@@ -382,7 +391,7 @@ def chat_endpoint(req: ChatRequest, request: Request) -> ChatResponse:
             sec_res = ask_secure_hr_bot_detailed(
                 req.message,
                 history=turns,
-                enable_input_guard=req.enable_input_guard,
+                enable_input_guard=cfg.secure_enable_input_guard,
             )
             leak_check = detect_sensitive_leak(sec_res.reply)
             guard_blocked = sec_res.blocked_by_input_guard or sec_res.blocked_by_output_dlp
@@ -441,10 +450,17 @@ def chat_endpoint(req: ChatRequest, request: Request) -> ChatResponse:
 def admin_audit_records_endpoint(request: Request) -> dict[str, Any]:
     """Model dışı (Out-of-Band RBAC) yetkili veri erişim uç noktası.
 
-    Hassas yönetim kayıtları LLM bağlamına konmak yerine bu uç noktada
-    `X-Admin-Token` ve `verify_admin_access` ile deterministik olarak doğrulanır.
+    Hassas yönetim kayıtları LLM bağlamına konmak yerine bu uç noktada hız sınırı,
+    `X-Admin-Token` ve sabit-zamanlı `verify_admin_access` ile deterministik doğrulanır.
     """
     cfg = load_settings()
+    ip = _effective_client_ip(request)
+    if not rate_limiter.allow(f"admin:{ip}", cfg.admin_rate_limit_per_minute, 60.0):
+        raise HTTPException(
+            status_code=429,
+            detail="Çok fazla yetkili kayıt sorgusu gönderildi. Lütfen bir dakika bekleyin.",
+        )
+
     if not cfg.admin_api_token:
         raise HTTPException(
             status_code=503,

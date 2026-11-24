@@ -57,7 +57,10 @@ def get_genai_client(cfg: Settings | None = None) -> genai.Client:
         raise BotConfigurationError("Sunucu API anahtarı yapılandırılmamış.")
 
     if _cached_client is None or _cached_api_key != active_cfg.gemini_api_key:
-        _cached_client = genai.Client(api_key=active_cfg.gemini_api_key)
+        _cached_client = genai.Client(
+            api_key=active_cfg.gemini_api_key,
+            http_options=types.HttpOptions(timeout=25_000),
+        )
         _cached_api_key = active_cfg.gemini_api_key
     return _cached_client
 

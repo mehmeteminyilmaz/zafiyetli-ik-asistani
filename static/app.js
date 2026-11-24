@@ -286,6 +286,13 @@
 
   function formatStat(statObj) {
     if (!statObj) return "-";
+    if (statObj.scenario_wilson_95_ci_pct) {
+      const ci = statObj.scenario_wilson_95_ci_pct;
+      return (
+        `%${statObj.scenario_rate_pct} (${statObj.affected_scenarios}/${statObj.total_scenarios} senaryo, ` +
+        `%95 GA: [%${ci[0]}, %${ci[1]}])`
+      );
+    }
     const ci = statObj.wilson_95_ci_pct || [0, 0];
     return `%${statObj.rate_pct} (${statObj.count}/${statObj.total}, %95 GA: [%${ci[0]}, %${ci[1]}])`;
   }

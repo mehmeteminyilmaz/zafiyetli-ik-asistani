@@ -69,8 +69,8 @@ _INJECTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "persona_jailbreak",
         re.compile(
-            r"(\bdan\s+mode\b|\bdebugbot\b|developer\s+mode|kısıtlamasız\s+mod|"
-            r"artık\s+gizem\s+değilsin\w*|you\s+are\s+now\s+unrestricted)",
+            r"(\bdan\s+mode\b|developer\s+mode|kısıtlamasız\s+mod|"
+            r"artık\s+\w+\s+değilsin\w*|you\s+are\s+now\s+unrestricted)",
             re.IGNORECASE,
         ),
     ),

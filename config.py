@@ -1,7 +1,7 @@
 """Uygulama genelindeki yapılandırma ayarları (tek doğruluk kaynağı).
 
 Tüm modüller (`hr_bot.py`, `hr_bot_guvenli.py`, `main.py`, `giskard_scan.py`,
-`redteam_benchmark.py`) ortam değişkenlerini yalnızca bu modül üzerinden okur.
+`redteam_benchmark.py`, `compliance_judge.py`) ortam değişkenlerini bu modül üzerinden okur.
 """
 
 from __future__ import annotations
@@ -58,16 +58,20 @@ class Settings:
     gemini_api_key: str
     gemini_model: str
     gemini_fallback_model: str
+    gemini_judge_model: str
     gemini_temperature: float
+    secure_enable_input_guard: bool
     host: str
     port: int
     reload: bool
     trust_proxy_headers: bool
+    trusted_proxy_count: int
     max_message_length: int
     max_history_turns: int
     session_ttl_seconds: int
     max_sessions: int
     chat_rate_limit_per_minute: int
+    admin_rate_limit_per_minute: int
     scan_rate_limit_per_5min: int
     scan_timeout_seconds: int
     scan_request_delay_seconds: float
@@ -77,7 +81,9 @@ class Settings:
     reports_dir: Path
     live_report_path: Path
     sample_report_path: Path
+    sample_secure_report_path: Path
     benchmark_json_path: Path
+    judge_validation_json_path: Path
 
     @property
     def has_valid_api_key(self) -> bool:
@@ -93,16 +99,21 @@ def load_settings() -> Settings:
         gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),
         gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip(),
         gemini_fallback_model=os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite").strip(),
+        # Hakem yanlılığını azaltmak ve yüksek kota sağlamak için hedef bottan (3.5-flash-lite) farklı model (3.1-flash-lite)
+        gemini_judge_model=os.getenv("GEMINI_JUDGE_MODEL", "gemini-3.1-flash-lite").strip(),
         gemini_temperature=_env_float("GEMINI_TEMPERATURE", 0.2),
+        secure_enable_input_guard=_env_bool("SECURE_ENABLE_INPUT_GUARD", True),
         host=os.getenv("HOST", "127.0.0.1").strip(),
         port=_env_int("PORT", 8000),
         reload=_env_bool("UVICORN_RELOAD", False),
         trust_proxy_headers=_env_bool("TRUST_PROXY_HEADERS", False),
+        trusted_proxy_count=max(1, _env_int("TRUSTED_PROXY_COUNT", 1)),
         max_message_length=_env_int("MAX_MESSAGE_LENGTH", 1000),
         max_history_turns=_env_int("MAX_HISTORY_TURNS", 10),
         session_ttl_seconds=_env_int("SESSION_TTL_SECONDS", 3600),
         max_sessions=_env_int("MAX_SESSIONS", 512),
         chat_rate_limit_per_minute=_env_int("CHAT_RATE_LIMIT_PER_MINUTE", 20),
+        admin_rate_limit_per_minute=_env_int("ADMIN_RATE_LIMIT_PER_MINUTE", 5),
         scan_rate_limit_per_5min=_env_int("SCAN_RATE_LIMIT_PER_5MIN", 2),
         scan_timeout_seconds=_env_int("SCAN_TIMEOUT_SECONDS", 600),
         scan_request_delay_seconds=_env_float("SCAN_REQUEST_DELAY_SECONDS", 1.2),
@@ -112,7 +123,9 @@ def load_settings() -> Settings:
         reports_dir=reports_dir,
         live_report_path=reports_dir / "giskard_zafiyet_raporu.html",
         sample_report_path=examples_dir / "ornek_giskard_raporu.html",
+        sample_secure_report_path=examples_dir / "ornek_giskard_guvenli_raporu.html",
         benchmark_json_path=examples_dir / "karsilastirma_sonuclari.json",
+        judge_validation_json_path=examples_dir / "hakem_dogrulama_sonuclari.json",
     )
 
 
