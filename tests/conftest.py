@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from fastapi.testclient import TestClient
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -25,12 +26,21 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
 @pytest.fixture(autouse=True)
 def _reset_api_state() -> None:
-    """Her testten önce hız sınırlayıcıyı ve tarama durumunu temizler."""
+    """Her testten önce hız sınırlayıcıyı, sunucu oturumlarını ve tarama durumunu temizler."""
     import llm_core
-    from main import ScanStatusSnapshot, rate_limiter, scan_manager
+    from main import ScanStatusSnapshot, rate_limiter, scan_manager, session_store
 
     rate_limiter.reset()
+    session_store.reset_all()
     with scan_manager._lock:
         scan_manager._state = ScanStatusSnapshot()
     llm_core._cached_client = None
     llm_core._cached_api_key = None
+
+
+@pytest.fixture()
+def loopback_client() -> TestClient:
+    """Üretim koduna 'testclient' sabiti eklemeden gerçek loopback IP (127.0.0.1) ile istemci oluşturur."""
+    from main import app
+
+    return TestClient(app, client=("127.0.0.1", 50000))

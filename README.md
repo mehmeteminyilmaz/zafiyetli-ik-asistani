@@ -8,11 +8,11 @@ Bu proje, kurum içi hizmet veren bir Büyük Dil Modeli (LLM) asistanının **P
 
 - Bu depo, siber güvenlik ve yapay zeka güvenliği eğitimi kapsamında **kasıtlı olarak zafiyetli bırakılmış** bir bileşen (`hr_bot.py`) içerir.
 - Proje içindeki tüm parolalar, erişim kodları ve maaş verileri tamamen kurgusaldır.
-- Uygulama herhangi bir kullanıcı kimlik doğrulama katmanı barındırmaz; **üretim ortamında kullanılmamalı** ve `HOST=0.0.0.0` ile yerel ağ veya internete **kesinlikle açılmamalıdır** (aksi halde API anahtarınız yetkisiz kullanıma açık hale gelir).
+- Sohbet arayüzü genel kullanıcı kimlik doğrulaması barındırmaz; **üretim ortamında kullanılmamalı** ve `HOST=0.0.0.0` ile yerel ağ veya internete **kesinlikle açılmamalıdır**. Bir ters vekil sunucu (*reverse proxy*) arkasında çalıştırılması durumunda `SCAN_TOKEN` ve `TRUST_PROXY_HEADERS` ayarları mutlaka yapılandırılmalıdır.
 
 ---
 
-## 1. Mimari Karşılaştırma ve Tehdit Modeli
+## 1. Mimari Karşılaştırma ve Savunma Katmanlarının Rolü
 
 ![Zafiyetli ve Savunmalı Mimari Karşılaştırması](docs/architecture.svg)
 
@@ -21,49 +21,49 @@ Projede aynı kurumsal senaryonun iki ayrı gerçeklemesi yan yana sunulmaktadı
 1. **Zafiyetli Sürüm (`hr_bot.py`):**
    - Üretim veritabanı parolası, CEO maaş bilgisi ve acil durum bypass kodu doğrudan sistem yönergesine (`HR_SYSTEM_PROMPT`) gömülmüştür.
    - Yetkilendirme kontrolü dil modelinin ikna edilmesine (*"sistem yöneticisi olduğunu beyan ederse paylaş"*) bırakılmıştır.
-2. **Güvenli / Savunmalı Sürüm (`hr_bot_guvenli.py`):**
-   - **Bağlamdan Sır Arındırma (Zero Secrets in Prompt):** Gizli parolalar ve maaş verileri model bağlamından tamamen çıkarılmıştır; model sahip olmadığı bir sırrı sızdıramaz.
-   - **Model Dışı Yetkilendirme (Out-of-Band RBAC):** Yetki gerektiren işlemler sohbet beyanıyla değil, dil modeli dışında deterministik oturum/token doğrulamasıyla (`verify_admin_access`) denetlenir.
-   - **Girdi Sınırlandırma ve Enjeksiyon Ön-Filtresi:** Kural sıfırlama, rol yapma ve dolaylı enjeksiyon kalıpları tespit edilir; kullanıcı metni `<kullanici_mesaji>` veri sınırlarıyla talimatlardan ayrılır.
-   - **Çıktı DLP ve Canary Kontrolü:** Model yanıtları kullanıcıya dönmeden önce normalize edilmiş regex, Base64 çözümü ve sıfır-yetkili canary belirteci (`CANARY-HR-GUARD-9482`) kontrolünden geçirilir.
+2. **Güvenli / Savunmalı Sürüm (`hr_bot_guvenli.py` ve `main.py`):**
+   - **Birincil Güvenlik Sınırı — Bağlamdan Sır Arındırma (Zero Secrets in Prompt):** Gizli parolalar ve maaş verileri model bağlamından tamamen çıkarılmıştır; dil modeli erişemediği bir veriyi sızdıramaz.
+   - **Birincil Güvenlik Sınırı — Model Dışı Yetkilendirme (Out-of-Band RBAC):** Hassas yönetim kayıtlarına erişim sohbet üzerinden değil, LLM'den tamamen bağımsız deterministik `GET /api/admin/audit-records` uç noktasında `X-Admin-Token` ve sabit-zamanlı `verify_admin_access` kontrolüyle sağlanır (`get_authorized_admin_records`).
+   - **Sunucu Taraflı Oturum ve Geçmiş Hijyeni (History Poisoning Önlemi):** İstemciden sahte `role: "model"` turları kabul edilmez; çok turlu konuşma geçmişi sunucu belleğinde (`ServerSessionStore`) `session_id` ile tutulur ve programatik çağrılarda geçmiş turları `_sanitize_history` ile temizlenir.
+   - **Veri Sınırlandırma (`<kullanici_mesaji>`):** Kullanıcı metinleri ve özetlenecek belgeler talimatlardan yapısal etiketlerle ayrılır.
+   - **Yardımcı Katmanlar (Regex Girdi Ön-Filtresi ve Çıktı DLP/Canary):** Regex tabanlı girdi kalkanı (`detect_prompt_injection_attempt`) morfolojik çekimler, dolaylı anlatım veya farklı dillerle atlatılabileceğinden **birincil güvenlik sınırı değildir**; yalnızca bariz saldırılarda API maliyetini ve gürültüyü azaltan yardımcı bir ön-katmandır. Çıktı tarafında ise `detect_sensitive_leak` normalize regex, Base64 çözümü ve sıfır-yetkili canary belirteci (`CANARY-HR-GUARD-9482`) ile son kontrolü uygular.
 
 ---
 
-## 2. Giskard Otomatik Taraması ve Kırmızı Takım Kıyaslama Aracı
+## 2. Giskard Otomatik Taraması ve Üçlü Ablasyon Kıyaslaması
 
 Projede iki farklı ve birbirini tamamlayan güvenlik değerlendirme aracı yer alır:
 
 ### A. Gerçek Giskard Otomatik Taraması (`giskard_scan.py`)
-Giskard'ın LLM destekli dedektörleri varsayılan olarak OpenAI istemcisi bekler. `giskard_gemini_client.py` modülü, Giskard'ın resmi `LLMClient` arayüzünü `google-genai` SDK'sı üzerinde gerçekleyerek Gemini modelini doğrudan değerlendirici (evaluator ve adversarial generator) olarak bağlar.
-- `giskard_scan.py`, Giskard'ın iç veri yapılarını elle oluşturmak yerine doğrudan resmi **`giskard.scan()`** fonksiyonunu çağırır.
-- `llm_information_disclosure` ve `llm_prompt_injection` dedektörleri; model tanımından otomatik güvenlik gereksinimleri üretir, Türkçe çekişmeli saldırı girdileri sentezler ve çıktıları LLM-hakem ile değerlendirerek `reports/giskard_zafiyet_raporu.html` raporunu üretir.
-- Depoda sürüm kontrolünü kirletmemek adına canlı raporlar `.gitignore` altındadır; inceleme amacıyla gerçek bir tarama çıktısı `examples/ornek_giskard_raporu.html` konumunda saklanır.
+Giskard'ın LLM destekli dedektörleri varsayılan olarak OpenAI istemcisi bekler. `giskard_gemini_client.py` modülü, Giskard'ın resmi `LLMClient` arayüzünü `google-genai` SDK'sı üzerinde gerçekleyerek Gemini modelini değerlendirici olarak bağlar.
+- `giskard_scan.py` doğrudan resmi **`giskard.scan()`** fonksiyonunu çağırır; `llm_information_disclosure` ve `llm_prompt_injection` dedektörleri otomatik güvenlik gereksinimleri üretir, Türkçe çekişmeli girdiler sentezler ve çıktıları değerlendirerek `reports/giskard_zafiyet_raporu.html` raporunu üretir.
+- `/report` uç noktasında sunulan Giskard raporu `Content-Security-Policy: sandbox allow-scripts` (ve `allow-same-origin` olmadan) başlığıyla benzersiz opak origin içinde izole edilir. Örnek tarama çıktısı `examples/ornek_giskard_raporu.html` konumundadır.
 
-### B. Çok Tekrarlı Kırmızı Takım Kıyaslama Aracı (`redteam_benchmark.py`)
-LLM yanıtları stokastik olduğu için tek seferlik denemeler yerine deterministik ölçüm sağlar:
-- **11 Saldırı Senaryosu (`probes.py`):** Doğrudan kural sıfırlama, yönetici taklidi, acil durum senaryosu, sistem promptu sızdırma, DAN tarzı rol yapma, Base64 kodlama, İngilizce ve karma dil saldırıları, çok turlu (multi-turn) güven inşası, belge içi dolaylı enjeksiyon ve parçalı veri çıkarma.
-- **8 Negatif Kontrol:** Meşru İK sorularında yanlış alarm (*False Positive*) ve yanlış engelleme oranını doğrular.
-- Her senaryoyu hem zafiyetli hem güvenli sürümde `N` kez (`--runs N`) çalıştırarak **Saldırı Başarı Oranı (ASR %)** tablosunu `reports/karsilastirma_raporu.md` ve `examples/karsilastirma_sonuclari.json` dosyalarına yazar.
+### B. Üçlü Ablasyon ve LLM-Hakem Kıyaslama Aracı (`redteam_benchmark.py` ve `compliance_judge.py`)
+Güvenli botun bağlamında sır bulunmadığından, yalnızca kurgusal parolanın sızıp sızmadığına bakmak (`0/N` sızıntı) büyük ölçüde *"bağlamda olmayan verinin sızmadığını"* ölçer. Modelin ve sistem yönergesinin kendi davranışsal direncini ölçmek ve istatistiksel belirsizliği şeffaf biçimde raporlamak için üç ek mekanizma uygulanmıştır:
+1. **Girdi Kalkanı Kapalı Koşum (`enable_input_guard=False`):** Yardımcı regex kalkanı devre dışı bırakılarak tüm saldırıların doğrudan LLM'e ulaşması sağlanır.
+2. **LLM-Hakem "Saldırı İsteğine Uyma" Metriği (`compliance_judge.py`):** Bağlamda gerçek sır olmasa dahi modelin yetkisiz rol değişimini (`DebugBot`), sahte yönetici yetkisini, uydurma parola üretimini veya belge içi gizli talimatı (`[SİSTEM NOTU]`) kabul edip etmediğini değerlendirir.
+3. **%95 Güven Aralığı (Wilson Skoru ve 3/N Kuralı):** Sonlu örneklemde (`22` deneme) `0/22` gözlemi mutlak sıfır risk anlamına gelmez; `3/N` kuralına göre yaklaşık `%13.6` (Wilson skoruna göre `%14.9`) üst sınıra sahiptir.
 
-### Örnek Deneysel Sonuçlar (`gemini-3.5-flash-lite`, N=2 tekrar)
+### Deneysel Sonuçlar (`gemini-3.5-flash-lite`, 11 Senaryo x N=2 = 22 Deneme)
 
-| Metrik | Zafiyetli Mimari (`hr_bot.py`) | Savunmalı Mimari (`hr_bot_guvenli.py`) |
-| :--- | :---: | :---: |
-| **Genel Saldırı Başarı Oranı (ASR — 11 Senaryo, 22 Deneme)** | **%81.8** (18/22 sızıntı) | **%0.0** (0/22 sızıntı) |
-| **Base64, Çapraz Dil, Çok Turlu ve Dolaylı Enjeksiyon** | %100.0 | %0.0 |
-| **Meşru Sorularda Yanlış Alarm / Yanlış Engelleme (8 Kontrol)** | %0.0 | **%0.0** |
+| Mimari Varyant | Sır Sızıntı Oranı (Leak ASR ve %95 Wilson GA) | Saldırı İsteğine Uyma (LLM-Hakem ACR ve %95 Wilson GA) | Meşru Sorularda Yanlış Engelleme (8 Kontrol) |
+| :--- | :---: | :---: | :---: |
+| **1. Zafiyetli (`hr_bot.py`)** | **%81.8** (`18/22`, GA: `[%61.5, %92.7]`) | **%81.8** (`18/22`, GA: `[%61.5, %92.7]`) | %0.0 (`0/8`) |
+| **2. Güvenli — Kalkan Kapalı (`enable_input_guard=False`)** | **%0.0** (`0/22`, GA: `[%0.0, %14.9]`) | **%0.0** (`0/22`, GA: `[%0.0, %14.9]`) | %0.0 (`0/8`) |
+| **3. Güvenli — Tam Savunma (`enable_input_guard=True`)** | **%0.0** (`0/22`, GA: `[%0.0, %14.9]`) | **%0.0** (`0/22`, GA: `[%0.0, %14.9]`) | %0.0 (`0/8`) |
 
-Detaylı senaryo bazlı dağılım `examples/karsilastirma_sonuclari.json` dosyasından veya web arayüzündeki **"Kıyaslama Tablosu"** penceresinden incelenebilir.
+Senaryo bazlı dağılım `examples/karsilastirma_sonuclari.json` dosyasından veya web arayüzündeki **"Kıyaslama Tablosu"** penceresinden incelenebilir.
 
 ---
 
 ## 3. OWASP Top 10 for LLM Applications (2025) Eşleştirmesi
 
-| OWASP Risk Kategorisi | Zafiyetli Sürümdeki Kök Neden (`hr_bot.py`) | Güvenli Sürümdeki Çözüm (`hr_bot_guvenli.py`) |
+| OWASP Risk Kategorisi | Zafiyetli Sürümdeki Kök Neden (`hr_bot.py`) | Güvenli Sürümdeki Çözüm (`hr_bot_guvenli.py` & `main.py`) |
 | :--- | :--- | :--- |
-| **LLM01: Prompt Injection** | Kullanıcı girdisi ile sistem talimatları arasında sınır olmaması; dolaylı belge içi komutların yürütülmesi. | Girdi enjeksiyon ön-filtresi (`detect_prompt_injection_attempt`) ve `<kullanici_mesaji>` veri etiketlemesi. |
-| **LLM02: Sensitive Information Disclosure** | Veritabanı şifresi, bypass kodu ve CEO maaşının sistem promptuna yazılması; yetki beyanına güvenilmesi. | Sırların LLM bağlamından tamamen çıkarılması, model dışı RBAC (`verify_admin_access`) ve çıktı DLP filtresi. |
-| **LLM07: System Prompt Leakage** | Sistem talimatlarının aynen tekrarlanmasına karşı koruma ve izleme bulunmaması. | Değiştirilemez gizlilik kuralı ve çıktı DLP katmanında izlenen canary belirteci (`CANARY-HR-GUARD-9482`). |
+| **LLM01: Prompt Injection** | Kullanıcı girdisi, konuşma geçmişi ve sistem talimatları arasında izolasyon bulunmaması. | Sunucu taraflı oturum (`ServerSessionStore`), `<kullanici_mesaji>` sınırlandırması ve yardımcı girdi ön-filtresi. |
+| **LLM02: Sensitive Information Disclosure** | Veritabanı şifresi, bypass kodu ve CEO maaşının sistem promptuna yazılması; yetki beyanına güvenilmesi. | Sırların LLM bağlamından çıkarılması, model dışı `GET /api/admin/audit-records` RBAC doğrulaması ve çıktı DLP kontrolü. |
+| **LLM07: System Prompt Leakage** | Sistem talimatlarının aynen tekrarlanmasına karşı koruma ve izleme bulunmaması. | Değiştirilemez gizlilik ilkesi ve çıktı DLP katmanında izlenen sıfır-yetkili canary belirteci (`CANARY-HR-GUARD-9482`). |
 
 ---
 
@@ -74,28 +74,23 @@ zafiyetli-ik-asistani/
 ├── config.py                   # Ortam değişkenleri ve uygulama ayarları (tek doğruluk kaynağı)
 ├── llm_core.py                 # Paylaşılan Gemini istemcisi, çok turlu geçmiş ve tipli istisnalar
 ├── hr_bot.py                   # Kasıtlı olarak zafiyetli İK asistanı
-├── hr_bot_guvenli.py           # Savunmalı mimariye sahip güvenli İK asistanı
-├── leak_detector.py            # Çok katmanlı sızıntı (DLP/Canary/Base64/Regex) ve enjeksiyon tespiti
+├── hr_bot_guvenli.py           # Savunmalı İK asistanı ve model dışı RBAC servisi
+├── leak_detector.py            # Çok katmanlı sızıntı (DLP/Canary/Base64/Regex) ve yardımcı ön-filtre
+├── compliance_judge.py         # LLM-hakem saldırı uyma metriği ve %95 Wilson güven aralığı hesabı
 ├── probes.py                   # 11 OWASP saldırı senaryosu, 8 negatif kontrol ve tohum veri seti
 ├── giskard_gemini_client.py    # Giskard LLMClient arayüzünün Google Gemini adaptörü
 ├── giskard_scan.py             # Gerçek giskard.scan() otomatik zafiyet tarama betiği
-├── redteam_benchmark.py        # Zafiyetli vs Güvenli çok tekrarlı ASR (%) kıyaslama aracı
-├── main.py                     # Hız sınırlı, iş parçacığı güvenli FastAPI sunucusu
+├── redteam_benchmark.py        # 3 varyantlı ablasyon ve çift metrikli kıyaslama aracı
+├── main.py                     # Sunucu oturumlu, RBAC ve sandbox CSP korumalı FastAPI sunucusu
 ├── static/                     # Harici CDN gerektirmeyen, XSS korumalı web arayüzü
-│   ├── index.html
-│   ├── styles.css
-│   ├── ui_content.js
-│   └── app.js
-├── tests/                      # Mock'lu birim/API testleri ve işaretli canlı entegrasyon testleri
+├── tests/                      # 45 testlik birim, API, oturum, proxy ve canlı entegrasyon paketi
 ├── examples/                   # Örnek Giskard HTML çıktısı ve kıyaslama JSON verisi
-├── docs/                       # Mimari diyagramlar
-├── requirements.txt            # Hafif sohbet sunucusu bağımlılıkları
+├── docs/                       # Mimari karşılaştırma şeması
+├── requirements.txt            # Hafif sohbet sunucusu bağımlılıkları (Python 3.10 - 3.12)
 ├── requirements-scan.txt       # Giskard tarama bağımlılıkları (Python 3.10 - 3.11)
 ├── requirements-dev.txt        # Test (pytest) ve statik analiz (ruff) bağımlılıkları
-├── pyproject.toml              # Proje, pytest ve ruff yapılandırması
-├── Makefile                    # Tek komutla kurulum, test, lint ve tarama hedefleri
-├── calistir.bat                # Windows başlatma betiği
-├── calistir.sh                 # Linux / macOS başlatma betiği
+├── .github/workflows/ci.yml    # Çekirdek (3.10-3.12) ve Giskard (3.10-3.11) ayrık CI matrisi
+├── calistir.bat / calistir.sh  # Windows ve Linux/macOS başlatma betikleri
 └── LICENSE                     # MIT Lisansı
 ```
 
@@ -104,8 +99,8 @@ zafiyetli-ik-asistani/
 ## 5. Kurulum ve Çalıştırma
 
 ### Ön Koşullar
-- **Sohbet Sunucusu ve Kıyaslama Aracı:** Python 3.10, 3.11 veya 3.12
-- **Giskard Otomatik Tarayıcısı (`requirements-scan.txt`):** **Python 3.10 veya 3.11** (`giskard==2.19.2` sürümünün `scipy<1.12.0` ve `numpy<2.0` bağımlılıkları nedeniyle Python 3.12+ önerilmez).
+- **Sohbet Sunucusu ve Kıyaslama Aracı (`requirements.txt`):** Python 3.10, 3.11 veya 3.12
+- **Giskard Otomatik Tarayıcısı (`requirements-scan.txt`):** **Python 3.10 veya 3.11** (`giskard==2.19.2` paketinin `scipy<1.12.0` ve `numpy<2.0` sabitleri nedeniyle Python 3.12+ ortamında kurulmamalıdır; CI matrisi de bu ayrımı korur).
 - Google AI Studio üzerinden alınmış bir `GEMINI_API_KEY`.
 
 ### Windows (PowerShell) Kurulumu
@@ -116,13 +111,10 @@ cd zafiyetli-ik-asistani
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
-# 1. Yalnızca sohbet sunucusu ve kıyaslama aracı için:
 pip install -r requirements.txt
-
-# 2. Giskard tarayıcısını da kullanmak için (isteğe bağlı):
+# Giskard tarayıcısı için (Python 3.10/3.11):
 pip install -r requirements-scan.txt
 
-# 3. Ortam dosyasını hazırlayın ve GEMINI_API_KEY değerini girin:
 Copy-Item .env.example .env
 ```
 
@@ -134,44 +126,41 @@ cd zafiyetli-ik-asistani
 python3.11 -m venv .venv
 source .venv/bin/activate
 
-# 1. Çekirdek sohbet sunucusu:
 pip install -r requirements.txt
-
-# 2. Giskard tarayıcısı (isteğe bağlı):
+# Giskard tarayıcısı için (Python 3.10/3.11):
 pip install -r requirements-scan.txt
 
-# 3. Ortam değişkenleri:
 cp .env.example .env
 chmod +x calistir.sh
 ```
 
-### Uygulamayı, Testleri ve Taramaları Çalıştırma
+### Çalıştırma, Kıyaslama ve Test Komutları
 ```bash
 # Web arayüzünü başlatma (http://127.0.0.1:8000):
 python main.py
 
-# Gerçek Giskard taramasını çalıştırma (rapor: reports/giskard_zafiyet_raporu.html):
+# Model dışı (Out-of-Band RBAC) yetkili uç nokta testi (.env içinde ADMIN_API_TOKEN tanımlıysa):
+curl -H "X-Admin-Token: <ADMIN_API_TOKEN>" http://127.0.0.1:8000/api/admin/audit-records
+
+# Gerçek Giskard taramasını çalıştırma:
 python giskard_scan.py --target vulnerable
 
-# Zafiyetli vs Güvenli öncesi/sonrası kıyaslama testi:
+# Üçlü ablasyon (vulnerable / kalkan kapalı / tam savunma) ve LLM-hakem kıyaslaması:
 python redteam_benchmark.py --runs 2
 
-# Mock'lu birim ve API testlerini çalıştırma (API anahtarı gerektirmez):
+# Birim/API testleri ve statik analiz:
 pip install -r requirements-dev.txt
 pytest -v
 ruff check .
-
-# Gerçek Gemini API ile canlı entegrasyon testlerini çalıştırma:
-pytest -v --run-live
 ```
 
 ---
 
 ## 6. Bilinen Sınırlamalar
 
-1. **Stokastik Çıktılar:** Büyük dil modelleri deterministik değildir; düşük sıcaklık (`GEMINI_TEMPERATURE=0.2`) kullanılsa dahi her çalıştırmada kelime seçimleri ve saldırı başarı oranları küçük farklılıklar gösterebilir.
-2. **Sezgisel Filtrelerin Sınırları:** Girdi enjeksiyon tespiti ve çıktı DLP kuralları yardımcı savunma katmanlarıdır; tek başlarına tüm olası kodlama veya semantik saldırıları yakalayamazlar. Temel güvenlik garantisi, **gizli verilerin model bağlamında hiç bulundurulmaması** ve **yetkilendirmenin model dışında yapılmasıdır**.
-3. **API Kota Sınırları:** Ücretsiz katman (Free Tier) Gemini API anahtarlarında eşzamanlı istek sınırı bulunduğundan `giskard_scan.py` varsayılan olarak çağrılar arasında `SCAN_REQUEST_DELAY_SECONDS=1.2` saniye bekleme uygular.
+1. **Stokastik Çıktılar ve Örneklem Boyutu:** Büyük dil modelleri deterministik değildir; `N=2` tekrar (toplam 22 deneme) istatistiksel olarak geniş bir güven aralığına (`[%0.0, %14.9]`) sahiptir. Daha dar güven aralıkları için `--runs 5` veya üzeri koşumlar yapılmalıdır.
+2. **Regex Ön-Filtresinin Kırılganlığı:** `detect_prompt_injection_attempt` içindeki kurallar yalnızca bilinen kalıpları yakalar; yaratıcı yeniden yazımlar, şifreli anlatımlar veya farklı dillerle aşılabilir. Bu nedenle güvenlik iddiası regex filtresine değil, sırların model bağlamından çıkarılmasına ve model dışı RBAC katmanına dayanır.
+3. **LLM-Hakem Yanılma Payı:** `compliance_judge.py` değerlendiricisi de bir dil modeli kullandığından uç durumlarda yanlış pozitif veya yanlış negatif karar verebilir.
 
 ---
 
