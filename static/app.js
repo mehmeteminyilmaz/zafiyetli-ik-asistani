@@ -2,8 +2,8 @@
  * TechCorp İK Asistanı İstemci Uygulaması
  * - XSS Korumalı: Kullanıcı ve bot çıktıları asla innerHTML ile eklenmez;
  *   yalnızca createElement + createTextNode kullanılır.
- * - Çok turlu konuşma geçmişi (chatHistory) desteklenir.
- * - Zafiyetli / Güvenli mod geçişi, canlı /health kontrolü ve HTTP durum doğrulaması içerir.
+ * - Sunucu Taraflı Oturum: Konuşma geçmişi istemciden gönderilmez (history poisoning önlemi);
+ *   yalnızca sunucunun ürettiği `session_id` korunur ve sıfırlamada `/api/chat/reset` çağrılır.
  */
 (function () {
   "use strict";
@@ -11,7 +11,7 @@
   const CONTENT = window.UI_CONTENT;
 
   let currentMode = "vulnerable";
-  let chatHistory = [];
+  let currentSessionId = null;
   let scanPollTimer = null;
 
   // DOM Referansları
@@ -36,9 +36,6 @@
   const btnCloseModal = document.getElementById("btn-close-modal");
   const benchModalBody = document.getElementById("benchmark-modal-body");
 
-  /**
-   * Çok satırlı metni XSS riski olmadan güvenli DOM düğümleri olarak ekler.
-   */
   function appendSafeMultilineText(container, text) {
     const lines = String(text ?? "").split("\n");
     lines.forEach((line, idx) => {
@@ -106,8 +103,17 @@
     chatMessages.scrollTop = chatMessages.scrollHeight;
   }
 
-  function resetConversation() {
-    chatHistory = [];
+  async function resetConversation() {
+    const oldSession = currentSessionId;
+    currentSessionId = null;
+    if (oldSession) {
+      fetch("/api/chat/reset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: oldSession }),
+      }).catch(() => {});
+    }
+
     while (chatMessages.firstChild) {
       chatMessages.removeChild(chatMessages.firstChild);
     }
@@ -191,20 +197,14 @@
         body: JSON.stringify({
           message,
           mode: currentMode,
-          history: chatHistory,
+          session_id: currentSessionId,
         }),
       });
 
-      let payload = null;
-      try {
-        payload = await response.json();
-      } catch (_parseErr) {
-        payload = null;
-      }
-
+      const payload = await response.json().catch(() => null);
       loadingRow.remove();
 
-      if (!response.ok) {
+      if (!response.ok || !payload) {
         const errDetail =
           (payload && typeof payload.detail === "string" && payload.detail) ||
           `İstek başarısız oldu (HTTP ${response.status}).`;
@@ -212,14 +212,8 @@
         return;
       }
 
-      const replyText = payload.reply || "";
-      chatHistory.push({ role: "user", content: message });
-      chatHistory.push({ role: "model", content: replyText });
-      if (chatHistory.length > 20) {
-        chatHistory = chatHistory.slice(-20);
-      }
-
-      appendMessage("bot", replyText, {
+      currentSessionId = payload.session_id || currentSessionId;
+      appendMessage("bot", payload.reply || "", {
         isLeak: Boolean(payload.is_leak),
         leakedCategories: Array.isArray(payload.leaked_categories) ? payload.leaked_categories : [],
         guardBlocked: Boolean(payload.guard_blocked),
@@ -290,26 +284,61 @@
     }
   }
 
+  function formatStat(statObj) {
+    if (!statObj) return "-";
+    const ci = statObj.wilson_95_ci_pct || [0, 0];
+    return `%${statObj.rate_pct} (${statObj.count}/${statObj.total}, %95 GA: [%${ci[0]}, %${ci[1]}])`;
+  }
+
   function buildBenchmarkDom(data) {
     while (benchModalBody.firstChild) {
       benchModalBody.removeChild(benchModalBody.firstChild);
     }
 
-    const summaryP = document.createElement("p");
-    summaryP.textContent =
-      `Model: ${data.model} | Probe Tekrarı (N): ${data.runs_per_probe} | ` +
-      `Zafiyetli Bot Genel ASR: %${data.vulnerable_overall_asr_pct} -> ` +
-      `Güvenli Bot Genel ASR: %${data.secure_overall_asr_pct} | ` +
-      `Yanlış Alarm Oranı (FPR): %${data.secure_false_positive_rate_pct}`;
-    summaryP.style.fontWeight = "600";
-    benchModalBody.appendChild(summaryP);
+    if (data.methodology_note) {
+      const noteP = document.createElement("p");
+      noteP.textContent = data.methodology_note;
+      benchModalBody.appendChild(noteP);
+    }
+
+    if (data.variants) {
+      const summaryTable = document.createElement("table");
+      summaryTable.className = "bench-table";
+      const sHead = document.createElement("thead");
+      const sHr = document.createElement("tr");
+      ["Mimari Varyant", "Sır Sızıntı Oranı (Leak)", "Saldırı İsteğine Uyma (LLM-Hakem)"].forEach((c) => {
+        const th = document.createElement("th");
+        th.textContent = c;
+        sHr.appendChild(th);
+      });
+      sHead.appendChild(sHr);
+      summaryTable.appendChild(sHead);
+
+      const sBody = document.createElement("tbody");
+      [
+        ["1. Zafiyetli (hr_bot.py)", data.variants.vulnerable],
+        ["2. Güvenli — Kalkan Kapalı (enable_input_guard=false)", data.variants.secure_no_guard],
+        ["3. Güvenli — Tam Savunma (enable_input_guard=true)", data.variants.secure_full],
+      ].forEach(([label, v]) => {
+        if (!v) return;
+        const tr = document.createElement("tr");
+        [label, formatStat(v.secret_leak), formatStat(v.attack_compliance)].forEach((val) => {
+          const td = document.createElement("td");
+          td.textContent = val;
+          tr.appendChild(td);
+        });
+        sBody.appendChild(tr);
+      });
+      summaryTable.appendChild(sBody);
+      benchModalBody.appendChild(summaryTable);
+    }
 
     const table = document.createElement("table");
     table.className = "bench-table";
 
     const thead = document.createElement("thead");
     const headRow = document.createElement("tr");
-    ["Kod", "Saldırı Senaryosu", "OWASP Kategorisi", "Zafiyetli ASR", "Güvenli ASR"].forEach(
+    ["Kod", "Senaryo", "Zafiyetli (Sızıntı/Uyma)", "Kalkan Kapalı (Sızıntı/Uyma)", "Tam Savunma (Sızıntı/Uyma)"].forEach(
       (col) => {
         const th = document.createElement("th");
         th.textContent = col;
@@ -320,14 +349,14 @@
     table.appendChild(thead);
 
     const tbody = document.createElement("tbody");
-    (data.probes || []).forEach((probe) => {
+    (data.probes || []).forEach((p) => {
       const tr = document.createElement("tr");
       [
-        probe.probe_id,
-        probe.title,
-        probe.owasp_category,
-        `%${probe.vulnerable_asr_pct} (${probe.vulnerable_leaks}/${probe.runs})`,
-        `%${probe.secure_asr_pct} (${probe.secure_leaks}/${probe.runs})`,
+        p.probe_id,
+        p.title,
+        `%${p.vuln_leak_pct} / %${p.vuln_compliance_pct}`,
+        `%${p.sec_noguard_leak_pct} / %${p.sec_noguard_compliance_pct}`,
+        `%${p.sec_full_leak_pct} / %${p.sec_full_compliance_pct}`,
       ].forEach((val) => {
         const td = document.createElement("td");
         td.textContent = String(val);
@@ -364,7 +393,6 @@
     benchModal.classList.add("hidden");
   }
 
-  // Olay Dinleyicileri
   chatForm.addEventListener("submit", handleSendMessage);
   btnReset.addEventListener("click", resetConversation);
   btnModeVuln.addEventListener("click", () => setMode("vulnerable"));
@@ -381,7 +409,6 @@
     }
   });
 
-  // İlk Yükleme
   renderShortcuts();
   setMode("vulnerable");
   refreshHealth();

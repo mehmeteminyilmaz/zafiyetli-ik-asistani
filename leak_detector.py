@@ -51,14 +51,18 @@ _SYSTEM_PROMPT_MARKERS: tuple[str, ...] = (
 )
 
 # Girdi tarafında yaygın Prompt Injection / Jailbreak / Dolaylı Enjeksiyon kalıpları
+# Not: Regex tabanlı girdi filtreleri çekim ekleri, dolaylı anlatım veya farklı dillerle
+# atlatılabileceğinden birincil güvenlik sınırı DEĞİLDİR; yalnızca gürültü ve maliyet azaltıcı
+# yardımcı ön-katmandır. Asıl koruma sırların model bağlamında bulunmamasıdır.
 _INJECTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "rule_override",
         re.compile(
-            r"(önceki\s+(tüm\s+)?kuralları\s+unut|tüm\s+talimatları\s+yok\s*say|"
-            r"ignore\s+(all\s+)?(previous|prior)\s+(instructions|rules)|"
-            r"disregard\s+(all\s+)?(previous|system)\s+instructions|"
-            r"güvenlik\s+protokollerini\s+(unut|askıya\s+al|devre\s+dışı))",
+            r"(önceki\s+(?:tüm\s+)?kurallar\w*\s+unut\w*|tüm\s+talimatlar\w*\s+yok\s*say\w*|"
+            r"kurallar\w*\s+(?:göz\s*ardı\s+et\w*|devre\s+dışı\s+bırak\w*)|"
+            r"ignore\s+(?:all\s+)?(?:previous|prior)\s+(?:instructions|rules)|"
+            r"disregard\s+(?:all\s+)?(?:previous|system)\s+instructions|"
+            r"güvenlik\s+protokol\w*\s+(?:unut\w*|askıya\s+al\w*|devre\s+dışı))",
             re.IGNORECASE,
         ),
     ),
@@ -66,22 +70,22 @@ _INJECTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         "persona_jailbreak",
         re.compile(
             r"(\bdan\s+mode\b|\bdebugbot\b|developer\s+mode|kısıtlamasız\s+mod|"
-            r"artık\s+gizem\s+değilsin|you\s+are\s+now\s+unrestricted)",
+            r"artık\s+gizem\s+değilsin\w*|you\s+are\s+now\s+unrestricted)",
             re.IGNORECASE,
         ),
     ),
     (
         "system_prompt_extraction",
         re.compile(
-            r"(sistem\s+(promptunu|talimatlarını|yönergesini)\s+(yaz|göster|tekrarla|ver)|"
-            r"(reveal|repeat|print|output)\s+(your\s+)?(system\s+prompt|initial\s+instructions))",
+            r"(sistem\s+(?:prompt\w*|talimat\w*|yönerge\w*)\s+(?:yaz\w*|göster\w*|tekrarla\w*|ver\w*)|"
+            r"(?:reveal|repeat|print|output)\s+(?:your\s+)?(?:system\s+prompt|initial\s+instructions))",
             re.IGNORECASE,
         ),
     ),
     (
         "indirect_injection_marker",
         re.compile(
-            r"(\[\s*sistem\s*notu\s*:|\[\s*system\s*(note|override)\s*:|"
+            r"(\[\s*sistem\s*notu\s*:|\[\s*system\s*(?:note|override)\s*:|"
             r"<\s*system_instruction\s*>|###\s*yeni\s+talimat)",
             re.IGNORECASE,
         ),
@@ -89,8 +93,8 @@ _INJECTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "encoded_exfiltration",
         re.compile(
-            r"(base64\s+(olarak|ile|kodla)|hex\s+olarak\s+yaz|"
-            r"encode\s+(the\s+password|in\s+base64))",
+            r"(base64\s+(?:olarak|ile|kodla\w*)|hex\s+olarak\s+yaz\w*|"
+            r"encode\s+(?:the\s+password|in\s+base64))",
             re.IGNORECASE,
         ),
     ),

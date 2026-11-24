@@ -62,14 +62,18 @@ class Settings:
     host: str
     port: int
     reload: bool
+    trust_proxy_headers: bool
     max_message_length: int
     max_history_turns: int
+    session_ttl_seconds: int
+    max_sessions: int
     chat_rate_limit_per_minute: int
     scan_rate_limit_per_5min: int
     scan_timeout_seconds: int
     scan_request_delay_seconds: float
     enable_scan_endpoint: bool
     scan_token: str
+    admin_api_token: str
     reports_dir: Path
     live_report_path: Path
     sample_report_path: Path
@@ -93,14 +97,18 @@ def load_settings() -> Settings:
         host=os.getenv("HOST", "127.0.0.1").strip(),
         port=_env_int("PORT", 8000),
         reload=_env_bool("UVICORN_RELOAD", False),
+        trust_proxy_headers=_env_bool("TRUST_PROXY_HEADERS", False),
         max_message_length=_env_int("MAX_MESSAGE_LENGTH", 1000),
         max_history_turns=_env_int("MAX_HISTORY_TURNS", 10),
+        session_ttl_seconds=_env_int("SESSION_TTL_SECONDS", 3600),
+        max_sessions=_env_int("MAX_SESSIONS", 512),
         chat_rate_limit_per_minute=_env_int("CHAT_RATE_LIMIT_PER_MINUTE", 20),
         scan_rate_limit_per_5min=_env_int("SCAN_RATE_LIMIT_PER_5MIN", 2),
         scan_timeout_seconds=_env_int("SCAN_TIMEOUT_SECONDS", 600),
         scan_request_delay_seconds=_env_float("SCAN_REQUEST_DELAY_SECONDS", 1.2),
         enable_scan_endpoint=_env_bool("ENABLE_SCAN_ENDPOINT", True),
         scan_token=os.getenv("SCAN_TOKEN", "").strip(),
+        admin_api_token=os.getenv("ADMIN_API_TOKEN", "").strip(),
         reports_dir=reports_dir,
         live_report_path=reports_dir / "giskard_zafiyet_raporu.html",
         sample_report_path=examples_dir / "ornek_giskard_raporu.html",

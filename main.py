@@ -1,11 +1,16 @@
 """FastAPI Arka Uç Sunucusu — Zafiyetli & Güvenli İK Asistanı ve Giskard Raporlayıcı.
 
 Güvenlik ve güvenilirlik özellikleri:
-- Aynı origin üzerinden servis edildiği için gevşek CORS (`*` + credentials) kullanılmaz.
-- Girdi uzunluk sınırları (`MAX_MESSAGE_LENGTH`), çok turlu geçmiş doğrulaması ve IP hız sınırı (rate limit) uygulanır.
-- Ham istisna/sağlayıcı hata mesajları istemciye sızdırılmaz; uygun HTTP durum kodları (400/403/429/502/503) döner.
-- Tarama durumu (`ScanStateManager`) `threading.Lock` ile korunur, yeni taramada `completed` bayrağı sıfırlanır
-  ve alt süreç `SCAN_TIMEOUT_SECONDS` zaman aşımıyla sınırlandırılır.
+- Konuşma geçmişi istemciden kabul edilmez (`history poisoning` önlemi); sunucu tarafında
+  TTL ve kapasite sınırlı `ServerSessionStore` içinde oturum kimliği (`session_id`) ile tutulur.
+- Model dışı (out-of-band) deterministik RBAC örneği `/api/admin/audit-records` uç noktasında
+  `verify_admin_access` / `get_authorized_admin_records` ile gerçek iş akışına bağlıdır.
+- `/report` uç noktası `Content-Security-Policy: sandbox allow-scripts` ile benzersiz opak
+  origin'de izole edilir; ana uygulama `script-src 'self'` CSP ile korunur.
+- Hız sınırlayıcı (`SlidingWindowRateLimiter`) süresi dolan anahtarları temizler ve bellek sınırı uygular.
+- Loopback kontrolü yalnızca gerçek IP adreslerini (`127.0.0.1`, `::1`) kabul eder ve
+  reverse-proxy başlıkları (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`) varsa doğrudan
+  loopback varsayımını reddeder.
 """
 
 from __future__ import annotations
@@ -14,11 +19,13 @@ import hmac
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
 import time
-from collections import deque
+import uuid
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -29,7 +36,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from config import BASE_DIR, load_settings
 from hr_bot import ask_hr_bot
-from hr_bot_guvenli import ask_secure_hr_bot_detailed
+from hr_bot_guvenli import ask_secure_hr_bot_detailed, get_authorized_admin_records
 from leak_detector import detect_sensitive_leak
 from llm_core import (
     BotAuthenticationError,
@@ -46,15 +53,28 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 STATIC_DIR = BASE_DIR / "static"
-LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "testclient"})
+# Üretim kodunda yalnızca gerçek geri döngü (loopback) IP sabitleri yer alır ("testclient" eklenmez)
+LOOPBACK_IPS = frozenset({"127.0.0.1", "::1"})
+PROXY_HEADERS = ("x-forwarded-for", "forwarded", "x-real-ip")
+_SESSION_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 
 
 class SlidingWindowRateLimiter:
-    """IP bazlı, iş parçacığı güvenli (thread-safe) kayan pencere hız sınırlayıcısı."""
+    """Bellek sınırı ve otomatik temizlik içeren iş parçacığı güvenli kayan pencere hız sınırlayıcısı."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_keys: int = 4096, cleanup_interval_seconds: float = 60.0) -> None:
         self._lock = threading.Lock()
-        self._hits: dict[str, deque[float]] = {}
+        self._hits: OrderedDict[str, deque[float]] = OrderedDict()
+        self._max_keys = max_keys
+        self._cleanup_interval = cleanup_interval_seconds
+        self._last_cleanup = time.monotonic()
+
+    def _prune_stale_unlocked(self, now: float, max_window: float) -> None:
+        cutoff = now - max(max_window, self._cleanup_interval)
+        stale_keys = [k for k, q in self._hits.items() if not q or q[-1] < cutoff]
+        for k in stale_keys:
+            del self._hits[k]
+        self._last_cleanup = now
 
     def allow(self, key: str, max_requests: int, window_seconds: float) -> bool:
         if max_requests <= 0:
@@ -62,7 +82,20 @@ class SlidingWindowRateLimiter:
         now = time.monotonic()
         cutoff = now - window_seconds
         with self._lock:
-            bucket = self._hits.setdefault(key, deque())
+            if now - self._last_cleanup >= self._cleanup_interval:
+                self._prune_stale_unlocked(now, window_seconds)
+
+            bucket = self._hits.get(key)
+            if bucket is None:
+                if len(self._hits) >= self._max_keys:
+                    self._prune_stale_unlocked(now, window_seconds)
+                if len(self._hits) >= self._max_keys:
+                    self._hits.popitem(last=False)
+                bucket = deque()
+                self._hits[key] = bucket
+            else:
+                self._hits.move_to_end(key)
+
             while bucket and bucket[0] < cutoff:
                 bucket.popleft()
             if len(bucket) >= max_requests:
@@ -73,6 +106,72 @@ class SlidingWindowRateLimiter:
     def reset(self) -> None:
         with self._lock:
             self._hits.clear()
+
+
+@dataclass
+class _SessionEntry:
+    mode: str
+    turns: list[ChatTurn]
+    updated_at: float
+
+
+class ServerSessionStore:
+    """Konuşma geçmişini istemci manipülasyonuna karşı sunucu belleğinde güvenli tutar."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._sessions: OrderedDict[str, _SessionEntry] = OrderedDict()
+
+    def _prune_unlocked(self, now: float, ttl_seconds: int, max_sessions: int) -> None:
+        cutoff = now - ttl_seconds
+        expired = [sid for sid, entry in self._sessions.items() if entry.updated_at < cutoff]
+        for sid in expired:
+            del self._sessions[sid]
+        while len(self._sessions) > max_sessions:
+            self._sessions.popitem(last=False)
+
+    def get_or_create(self, session_id: str | None, mode: str) -> tuple[str, list[ChatTurn]]:
+        cfg = load_settings()
+        now = time.monotonic()
+        valid_id = session_id if (session_id and _SESSION_ID_RE.match(session_id)) else uuid.uuid4().hex
+
+        with self._lock:
+            self._prune_unlocked(now, cfg.session_ttl_seconds, cfg.max_sessions)
+            entry = self._sessions.get(valid_id)
+            if entry is None or entry.mode != mode:
+                # Mod değiştiğinde veya oturum yoksa temiz geçmiş başlatılır
+                self._sessions[valid_id] = _SessionEntry(mode=mode, turns=[], updated_at=now)
+                self._sessions.move_to_end(valid_id)
+                return valid_id, []
+            entry.updated_at = now
+            self._sessions.move_to_end(valid_id)
+            return valid_id, list(entry.turns)
+
+    def append_exchange(self, session_id: str, mode: str, user_msg: str, model_reply: str) -> None:
+        cfg = load_settings()
+        now = time.monotonic()
+        max_items = max(2, cfg.max_history_turns * 2)
+        with self._lock:
+            entry = self._sessions.get(session_id)
+            if entry is None or entry.mode != mode:
+                entry = _SessionEntry(mode=mode, turns=[], updated_at=now)
+                self._sessions[session_id] = entry
+            entry.turns.append(ChatTurn(role="user", content=user_msg))
+            entry.turns.append(ChatTurn(role="model", content=model_reply))
+            if len(entry.turns) > max_items:
+                entry.turns = entry.turns[-max_items:]
+            entry.updated_at = now
+            self._sessions.move_to_end(session_id)
+
+    def clear_session(self, session_id: str | None) -> None:
+        if not session_id:
+            return
+        with self._lock:
+            self._sessions.pop(session_id, None)
+
+    def reset_all(self) -> None:
+        with self._lock:
+            self._sessions.clear()
 
 
 @dataclass
@@ -93,7 +192,6 @@ class ScanStateManager:
         self._state = ScanStatusSnapshot()
 
     def try_begin_scan(self, target: str) -> bool:
-        """Tarama çalışmıyorsa yeni tarama başlatır ve önceki `completed` bayrağını sıfırlar."""
         with self._lock:
             if self._state.is_running:
                 return False
@@ -130,25 +228,38 @@ class ScanStateManager:
 
 
 rate_limiter = SlidingWindowRateLimiter()
+session_store = ServerSessionStore()
 scan_manager = ScanStateManager()
 
 app = FastAPI(
     title="TechCorp İK Asistanı — Yapay Zeka Güvenlik Laboratuvarı",
     description="Zafiyetli ve Güvenli İK Botu + Giskard Otomatik Güvenlik Taraması",
-    version="2.0.0",
+    version="2.1.0",
 )
 
 
 @app.middleware("http")
 async def security_headers_middleware(request: Request, call_next: Any) -> Response:
-    """Temel güvenlik başlıklarını (CSP, X-Content-Type-Options, X-Frame-Options) ekler."""
+    """Ana uygulama ve izole Giskard raporu için uygun CSP ve güvenlik başlıklarını uygular."""
     response: Response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "SAMEORIGIN"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    # Giskard'ın ürettiği bağımsız HTML raporu kendi gömülü stil/betiklerini içerdiğinden
-    # sıkı CSP yalnızca ana uygulama ve statik varlıklara uygulanır.
-    if not request.url.path.startswith("/report"):
+
+    if request.url.path.startswith("/report"):
+        # `sandbox allow-scripts` (allow-same-origin OLMADAN) raporu opak `null` origin içine hapseder:
+        # Giskard'ın sekme geçişleri ve gömülü stilleri çalışır ancak rapor içindeki hiçbir betik
+        # ana uygulamanın origin'ine, çerezlerine veya API uç noktalarına erişemez.
+        response.headers["Content-Security-Policy"] = (
+            "sandbox allow-scripts; "
+            "default-src 'none'; "
+            "style-src 'unsafe-inline'; "
+            "script-src 'unsafe-inline'; "
+            "img-src data:; "
+            "base-uri 'none'; "
+            "form-action 'none';"
+        )
+    else:
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
             "script-src 'self'; "
@@ -161,19 +272,13 @@ async def security_headers_middleware(request: Request, call_next: Any) -> Respo
     return response
 
 
-class HistoryItem(BaseModel):
-    """Konuşma geçmişindeki tek bir mesaj öğesi."""
-
-    role: Literal["user", "model"]
-    content: str = Field(..., min_length=1, max_length=2000)
-
-
 class ChatRequest(BaseModel):
-    """Sohbet uç noktası istek şeması."""
+    """Sohbet uç noktası istek şeması (geçmiş istemciden alınmaz, `session_id` ile sunucuda tutulur)."""
 
     message: str = Field(..., min_length=1, max_length=1000)
     mode: Literal["vulnerable", "secure"] = "vulnerable"
-    history: list[HistoryItem] = Field(default_factory=list, max_length=20)
+    session_id: str | None = Field(default=None, max_length=64)
+    enable_input_guard: bool = True
 
     @field_validator("message")
     @classmethod
@@ -192,10 +297,17 @@ class ChatResponse(BaseModel):
 
     reply: str
     mode: Literal["vulnerable", "secure"]
+    session_id: str
     is_leak: bool = False
     leaked_categories: list[str] = Field(default_factory=list)
     guard_blocked: bool = False
     triggered_rules: list[str] = Field(default_factory=list)
+
+
+class ResetSessionRequest(BaseModel):
+    """Sunucu taraflı oturum geçmişi sıfırlama isteği."""
+
+    session_id: str | None = Field(default=None, max_length=64)
 
 
 class ScanRequest(BaseModel):
@@ -204,8 +316,31 @@ class ScanRequest(BaseModel):
     target: Literal["vulnerable", "secure"] = "vulnerable"
 
 
-def _client_ip(request: Request) -> str:
+def _has_proxy_headers(request: Request) -> bool:
+    return any(h in request.headers for h in PROXY_HEADERS)
+
+
+def _effective_client_ip(request: Request) -> str:
+    """Hız sınırlaması için istemci IP'sini belirler (`TRUST_PROXY_HEADERS=true` ise XFF ilk IP)."""
+    cfg = load_settings()
+    if cfg.trust_proxy_headers:
+        xff = request.headers.get("x-forwarded-for", "")
+        if xff:
+            first_ip = xff.split(",")[0].strip()
+            if first_ip:
+                return first_ip
+        real_ip = request.headers.get("x-real-ip", "").strip()
+        if real_ip:
+            return real_ip
     return request.client.host if request.client else "unknown"
+
+
+def _is_direct_loopback_request(request: Request) -> bool:
+    """İsteğin bir reverse proxy üzerinden değil, doğrudan yerel makineden geldiğini doğrular."""
+    if _has_proxy_headers(request):
+        return False
+    direct_host = request.client.host if request.client else ""
+    return direct_host in LOOPBACK_IPS
 
 
 @app.get("/health")
@@ -218,40 +353,58 @@ def health_endpoint() -> dict[str, Any]:
         "model": cfg.gemini_model,
         "live_report_exists": cfg.live_report_path.exists(),
         "sample_report_exists": cfg.sample_report_path.exists(),
+        "rbac_admin_configured": bool(cfg.admin_api_token),
     }
+
+
+@app.post("/api/chat/reset")
+def reset_chat_session(req: ResetSessionRequest) -> dict[str, str]:
+    """İlgili oturumun sunucu belleğindeki konuşma geçmişini temizler."""
+    session_store.clear_session(req.session_id)
+    return {"status": "cleared", "session_id": uuid.uuid4().hex}
 
 
 @app.post("/api/chat", response_model=ChatResponse)
 def chat_endpoint(req: ChatRequest, request: Request) -> ChatResponse:
-    """Kullanıcı mesajını seçilen moddaki (`vulnerable` / `secure`) İK botuna iletir."""
+    """Kullanıcı mesajını sunucu taraflı oturum geçmişiyle seçilen İK botuna iletir."""
     cfg = load_settings()
-    ip = _client_ip(request)
+    ip = _effective_client_ip(request)
     if not rate_limiter.allow(f"chat:{ip}", cfg.chat_rate_limit_per_minute, 60.0):
         raise HTTPException(
             status_code=429,
             detail="Çok fazla mesaj gönderildi. Lütfen bir dakika bekleyip tekrar deneyin.",
         )
 
-    turns = [ChatTurn(role=item.role, content=item.content) for item in req.history]
+    session_id, turns = session_store.get_or_create(req.session_id, req.mode)
 
     try:
         if req.mode == "secure":
-            sec_res = ask_secure_hr_bot_detailed(req.message, history=turns)
+            sec_res = ask_secure_hr_bot_detailed(
+                req.message,
+                history=turns,
+                enable_input_guard=req.enable_input_guard,
+            )
             leak_check = detect_sensitive_leak(sec_res.reply)
+            guard_blocked = sec_res.blocked_by_input_guard or sec_res.blocked_by_output_dlp
+            if not guard_blocked:
+                session_store.append_exchange(session_id, "secure", req.message, sec_res.reply)
             return ChatResponse(
                 reply=sec_res.reply,
                 mode="secure",
+                session_id=session_id,
                 is_leak=leak_check.is_leak,
                 leaked_categories=leak_check.categories,
-                guard_blocked=sec_res.blocked_by_input_guard or sec_res.blocked_by_output_dlp,
+                guard_blocked=guard_blocked,
                 triggered_rules=sec_res.triggered_rules,
             )
 
         reply = ask_hr_bot(req.message, history=turns)
         leak_check = detect_sensitive_leak(reply)
+        session_store.append_exchange(session_id, "vulnerable", req.message, reply)
         return ChatResponse(
             reply=reply,
             mode="vulnerable",
+            session_id=session_id,
             is_leak=leak_check.is_leak,
             leaked_categories=leak_check.categories,
             guard_blocked=False,
@@ -282,6 +435,27 @@ def chat_endpoint(req: ChatRequest, request: Request) -> ChatResponse:
             status_code=502,
             detail="Yapay zeka servisinden yanıt alınamadı. Lütfen tekrar deneyin.",
         ) from exc
+
+
+@app.get("/api/admin/audit-records")
+def admin_audit_records_endpoint(request: Request) -> dict[str, Any]:
+    """Model dışı (Out-of-Band RBAC) yetkili veri erişim uç noktası.
+
+    Hassas yönetim kayıtları LLM bağlamına konmak yerine bu uç noktada
+    `X-Admin-Token` ve `verify_admin_access` ile deterministik olarak doğrulanır.
+    """
+    cfg = load_settings()
+    if not cfg.admin_api_token:
+        raise HTTPException(
+            status_code=503,
+            detail="Yönetici RBAC servisi yapılandırılmamış (ADMIN_API_TOKEN tanımlı değil).",
+        )
+
+    provided_token = request.headers.get("X-Admin-Token", "")
+    try:
+        return get_authorized_admin_records(provided_token, cfg.admin_api_token)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
 def _run_giskard_subprocess(target: str, timeout_seconds: int) -> None:
@@ -315,21 +489,22 @@ def _run_giskard_subprocess(target: str, timeout_seconds: int) -> None:
 
 
 def _verify_scan_permission(request: Request) -> None:
-    """Tarama uç noktasını yerel istemci ve/veya `SCAN_TOKEN` ile korur."""
+    """Tarama uç noktasını doğrudan yerel istemci ve/veya `SCAN_TOKEN` ile korur."""
     cfg = load_settings()
     if not cfg.enable_scan_endpoint:
         raise HTTPException(status_code=403, detail="Web üzerinden tarama tetikleme devre dışı bırakılmış.")
 
-    client_host = _client_ip(request)
     provided_token = request.headers.get("X-Scan-Token", "")
-
     if cfg.scan_token:
         if not provided_token or not hmac.compare_digest(provided_token, cfg.scan_token):
             raise HTTPException(status_code=403, detail="Geçersiz veya eksik tarama yetki anahtarı (X-Scan-Token).")
-    elif client_host not in LOOPBACK_HOSTS:
+    elif not _is_direct_loopback_request(request):
         raise HTTPException(
             status_code=403,
-            detail="Güvenlik nedeniyle tarama yalnızca yerel makineden (localhost) başlatılabilir.",
+            detail=(
+                "Güvenlik nedeniyle tarama yalnızca doğrudan yerel makineden (localhost) başlatılabilir. "
+                "Reverse proxy arkasında çalıştırıyorsanız SCAN_TOKEN tanımlayın."
+            ),
         )
 
 
@@ -341,7 +516,7 @@ def run_scan_endpoint(
     """Gerçek `giskard.scan()` sürecini arka planda güvenli şekilde başlatır."""
     _verify_scan_permission(request)
     cfg = load_settings()
-    ip = _client_ip(request)
+    ip = _effective_client_ip(request)
 
     if not cfg.has_valid_api_key:
         raise HTTPException(status_code=503, detail="Tarama başlatılamadı: GEMINI_API_KEY tanımlı değil.")
