@@ -1,5 +1,7 @@
-google-genai>=2.30.0
-python-dotenv>=1.0.0
-fastapi>=0.110.0
-uvicorn>=0.28.0
-
+# Çekirdek sohbet sunucusu ve kırmızı takım kıyaslama bağımlılıkları (Python 3.10 - 3.12)
+# Giskard tarayıcısını kurmak için ayrıca: pip install -r requirements-scan.txt
+google-genai>=2.34.0,<3.0.0
+python-dotenv>=1.2.0,<2.0.0
+fastapi>=0.115.0,<1.0.0
+uvicorn>=0.30.0,<1.0.0
+pydantic>=2.10.0,<3.0.0

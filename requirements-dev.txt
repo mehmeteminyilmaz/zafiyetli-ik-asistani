@@ -1,0 +1,5 @@
+# Test ve statik kod analizi (lint) bağımlılıkları
+-r requirements.txt
+pytest>=8.0.0,<10.0.0
+httpx>=0.28.0,<1.0.0
+ruff>=0.9.0,<1.0.0

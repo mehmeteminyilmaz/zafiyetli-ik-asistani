@@ -1,0 +1,7 @@
+# Otomatik Giskard güvenlik tarayıcısı bağımlılıkları
+# NOT: giskard==2.19.2 paketi scipy<1.12.0 ve numpy<2.0 gerektirir;
+# bu nedenle tarama ortamı için Python 3.10 veya Python 3.11 kullanılmalıdır.
+-r requirements.txt
+giskard==2.19.2
+pandas>=2.0.0,<4.0.0
+litellm==1.106.6

@@ -1,0 +1,22 @@
+[project]
+name = "zafiyetli-ik-asistani"
+version = "2.0.0"
+description = "Kurum içi LLM asistanlarında Prompt Injection zafiyetleri, savunmalı mimari ve Giskard otomatik güvenlik taraması eğitim projesi."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10,<3.13"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "live: Gerçek Gemini API anahtarı gerektiren canlı entegrasyon testleri (varsayılan olarak atlanır).",
+]
+
+[tool.ruff]
+line-length = 108
+target-version = "py310"
+extend-exclude = [".venv", "venv", "reports", "examples"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]
