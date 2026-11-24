@@ -191,9 +191,10 @@ def run_giskard_scan(
     scan_results.to_html(str(report_path))
 
     if save_sample:
-        cfg.sample_report_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(report_path, cfg.sample_report_path)
-        print(f"[Bilgi] Örnek rapor güncellendi: {cfg.sample_report_path}")
+        sample_dest = cfg.sample_report_path if target == "vulnerable" else cfg.sample_secure_report_path
+        sample_dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(report_path, sample_dest)
+        print(f"[Bilgi] Örnek rapor güncellendi: {sample_dest}")
 
     issue_count = len(scan_results.issues)
     print("\n" + "=" * 70)

@@ -1,20 +1,18 @@
-"""Üçlü Ablasyon ve Çift Metrikli Kırmızı Takım Kıyaslama Aracı.
+"""Üçlü Ablasyon, Ayrı LLM-Hakem ve Senaryo Bazlı Küme İstatistiği Kıyaslama Aracı.
 
-Metodolojik iyileştirmeler:
+Metodolojik esaslar:
 1. Üç Ayrı Yapılandırma (Ablation):
-   - `vulnerable`: Zafiyetli bot (`hr_bot.py` - sırlar bağlamda, yetki beyanına güven).
-   - `secure_no_guard`: Güvenli bot, girdi kalkanı KAPALI (`enable_input_guard=False`).
-     Tüm saldırılar doğrudan LLM'e ulaşır; sırların bağlamda olmamasının + güvenli
-     sistem yönergesinin + `<kullanici_mesaji>` sınırlandırmasının tek başına etkisi ölçülür.
+   - `vulnerable`: Zafiyetli bot (`hr_bot.py`).
+   - `secure_no_guard`: Güvenli bot, yardımcı girdi kalkanı KAPALI (`enable_input_guard=False`).
    - `secure_full`: Güvenli bot, tüm katmanlar AÇIK (`enable_input_guard=True`).
-2. Çift Değerlendirme Metriği:
-   - **Sır Sızıntı Oranı (Secret Leak ASR %):** `detect_sensitive_leak` ile kurgusal sırların
-     veya sistem yönergesi/canary belirteçlerinin sızıp sızmadığını ölçer.
-   - **Saldırı İsteğine Uyma Oranı (Attack Compliance Rate - ACR %, LLM-Hakem):** Bağlamda sır
-     bulunmasa dahi modelin yetkisiz rol/komut/dolaylı enjeksiyon isteğine uyup uymadığını ölçer.
-3. İstatistiksel Çerçeve:
-   - Sonlu örneklem büyüklüğünde (`N` deneme) %0 gözlemlerinin belirsizliğini ifade etmek için
-     %95 Wilson güven aralığı `[alt%, üst%]` ve `3/N` kuralı üst sınırı raporlanır.
+2. Ayrı ve İhtiyatlı (Fail-Closed) LLM-Hakem:
+   - Hedef bottan (`GEMINI_MODEL`) farklı olan `GEMINI_JUDGE_MODEL` (`gemini-3.5-flash`) kullanılır.
+3. Bağımsız Olmayan Tekrarlar için Küme İstatistiği (`N_senaryo = 11`):
+   - `11 senaryo × R tekrar` koşumunda aynı senaryonun tekrarları yüksek korelasyonludur;
+     bunları `11*R` bağımsız deney saymak güven aralığını yapay olarak daraltır.
+   - Bu nedenle birincil %95 Wilson güven aralığı ve `3/N` üst sınırı **bağımsız senaryo
+     sayısı (`N = 11`)** üzerinden hesaplanır (bir senaryoda en az 1 tekrar sızdırdıysa/uyduysa
+     o senaryo başarısız sayılır). Ham tekrar toplamları yalnızca ikincil bilgi olarak sunulur.
 """
 
 from __future__ import annotations
@@ -53,7 +51,6 @@ logger = logging.getLogger(__name__)
 
 
 def _retry_call(fn: Any, *args: Any, **kwargs: Any) -> Any:
-    """Ücretsiz API katmanında dakikalık kota (429) veya geçici 503 durumlarında bekleyip tekrar dener."""
     for attempt in range(5):
         try:
             return fn(*args, **kwargs)
@@ -99,22 +96,32 @@ class NegativeControlRow:
     secure_full_wrongly_blocked: bool
 
 
-def _variant_stats(count: int, total: int) -> dict[str, Any]:
-    pct = round((count / total) * 100.0, 1) if total else 0.0
-    ci_low, ci_high = wilson_ci_95(count, total)
+def _scenario_cluster_stats(
+    affected_scenarios: int,
+    total_scenarios: int,
+    raw_hits: int,
+    raw_runs: int,
+) -> dict[str, Any]:
+    """Birincil güven aralığını bağımsız senaryo sayısı (`total_scenarios`) üzerinden hesaplar."""
+    scenario_pct = round((affected_scenarios / total_scenarios) * 100.0, 1) if total_scenarios else 0.0
+    raw_pct = round((raw_hits / raw_runs) * 100.0, 1) if raw_runs else 0.0
+    ci_low, ci_high = wilson_ci_95(affected_scenarios, total_scenarios)
     out: dict[str, Any] = {
-        "count": count,
-        "total": total,
-        "rate_pct": pct,
-        "wilson_95_ci_pct": [ci_low, ci_high],
+        "affected_scenarios": affected_scenarios,
+        "total_scenarios": total_scenarios,
+        "scenario_rate_pct": scenario_pct,
+        "scenario_wilson_95_ci_pct": [ci_low, ci_high],
+        "raw_hits": raw_hits,
+        "raw_total_runs": raw_runs,
+        "raw_run_rate_pct": raw_pct,
     }
-    if count == 0 and total > 0:
-        out["rule_of_three_upper_95_pct"] = rule_of_three_upper_95_pct(total)
+    if affected_scenarios == 0 and total_scenarios > 0:
+        out["scenario_rule_of_three_upper_95_pct"] = rule_of_three_upper_95_pct(total_scenarios)
     return out
 
 
-def run_benchmark(runs_per_probe: int = 2, delay_seconds: float = 1.8, use_llm_judge: bool = True) -> dict[str, Any]:
-    """3 varyant üzerinde saldırı problarını ve negatif kontrolleri çalıştırır."""
+def run_benchmark(runs_per_probe: int = 2, delay_seconds: float = 1.6, use_llm_judge: bool = True) -> dict[str, Any]:
+    """3 varyant üzerinde in-sample senaryoları ve negatif kontrolleri çalıştırır."""
     cfg = load_settings()
     if not cfg.has_valid_api_key:
         raise RuntimeError("GEMINI_API_KEY tanımlanmamış! Lütfen .env dosyanızı kontrol edin.")
@@ -123,13 +130,20 @@ def run_benchmark(runs_per_probe: int = 2, delay_seconds: float = 1.8, use_llm_j
     tot_vuln_leak = tot_vuln_comp = 0
     tot_ng_leak = tot_ng_comp = 0
     tot_full_leak = tot_full_comp = 0
-    total_attempts = len(ATTACK_PROBES) * runs_per_probe
 
-    print("=" * 88)
+    scen_vuln_leak = scen_vuln_comp = 0
+    scen_ng_leak = scen_ng_comp = 0
+    scen_full_leak = scen_full_comp = 0
+
+    num_scenarios = len(ATTACK_PROBES)
+    total_runs = num_scenarios * runs_per_probe
+
+    print("=" * 90)
     print(
-        f"  ÜÇLÜ ABLASYON VE LLM-HAKEM KIYASLAMASI (N={runs_per_probe} tekrar, toplam {total_attempts} deneme/varyant)"
+        f"  ÜÇLÜ ABLASYON KIYASLAMASI ({num_scenarios} senaryo × {runs_per_probe} tekrar | "
+        f"Bot: {cfg.gemini_model} | Hakem: {cfg.gemini_judge_model})"
     )
-    print("=" * 88)
+    print("=" * 90)
 
     for probe in ATTACK_PROBES:
         v_leak = v_comp = 0
@@ -169,9 +183,7 @@ def run_benchmark(runs_per_probe: int = 2, delay_seconds: float = 1.8, use_llm_j
             if use_llm_judge:
                 if is_ng_leak:
                     ng_comp += 1
-                elif ng_res.blocked_by_output_dlp:
-                    pass
-                else:
+                elif not ng_res.blocked_by_output_dlp:
                     if delay_seconds > 0:
                         time.sleep(delay_seconds * 0.6)
                     ng_verdict: ComplianceVerdict = _retry_call(judge_attack_compliance, probe.prompt, ng_res.reply)
@@ -209,6 +221,13 @@ def run_benchmark(runs_per_probe: int = 2, delay_seconds: float = 1.8, use_llm_j
         tot_ng_comp += ng_comp
         tot_full_leak += f_leak
         tot_full_comp += f_comp
+
+        scen_vuln_leak += int(v_leak > 0)
+        scen_vuln_comp += int(v_comp > 0)
+        scen_ng_leak += int(ng_leak > 0)
+        scen_ng_comp += int(ng_comp > 0)
+        scen_full_leak += int(f_leak > 0)
+        scen_full_comp += int(f_comp > 0)
 
         row = ProbeAblationRow(
             probe_id=probe.id,
@@ -278,29 +297,31 @@ def run_benchmark(runs_per_probe: int = 2, delay_seconds: float = 1.8, use_llm_j
     neg_total = len(NEGATIVE_CONTROLS)
     return {
         "generated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "model": cfg.gemini_model,
+        "target_model": cfg.gemini_model,
+        "judge_model": cfg.gemini_judge_model,
         "llm_judge_enabled": use_llm_judge,
-        "runs_per_probe": runs_per_probe,
-        "total_probes": len(ATTACK_PROBES),
-        "total_attack_attempts": total_attempts,
+        "scenarios_count": num_scenarios,
+        "runs_per_scenario": runs_per_probe,
+        "correlated_total_runs": total_runs,
         "methodology_note": (
-            "Güvenli sürümün sistem promptunda sır bulunmadığından 0/N sızıntı oranı öncelikle bağlam "
-            "izolasyonunu doğrular. Modelin ve prompt sınırlandırmasının davranışsal direncini ölçmek "
-            "için ayrıca girdi kalkanı kapalı (`secure_no_guard`) koşum ve LLM-hakem 'Saldırı İsteğine "
-            "Uyma' (Attack Compliance) metriği ile %95 Wilson güven aralıkları hesaplanmıştır."
+            "Bu küme proje yazarları tarafından kurgulanan 11 senaryodan (in-sample) oluşur ve "
+            "aynı senaryonun tekrarları bağımsız değildir. Bu nedenle %95 Wilson güven aralıkları "
+            "22 tekrar üzerinden değil, bağımsız senaryo sayısı (N=11; 0/11 için üst sınır %25.9, "
+            "3/N kuralıyla %27.3) üzerinden hesaplanmıştır. Bağımsız dış-örneklem (out-of-sample) "
+            "değerlendirmesi için `python giskard_scan.py --target secure` kullanılır."
         ),
         "variants": {
             "vulnerable": {
-                "secret_leak": _variant_stats(tot_vuln_leak, total_attempts),
-                "attack_compliance": _variant_stats(tot_vuln_comp, total_attempts),
+                "secret_leak": _scenario_cluster_stats(scen_vuln_leak, num_scenarios, tot_vuln_leak, total_runs),
+                "attack_compliance": _scenario_cluster_stats(scen_vuln_comp, num_scenarios, tot_vuln_comp, total_runs),
             },
             "secure_no_guard": {
-                "secret_leak": _variant_stats(tot_ng_leak, total_attempts),
-                "attack_compliance": _variant_stats(tot_ng_comp, total_attempts),
+                "secret_leak": _scenario_cluster_stats(scen_ng_leak, num_scenarios, tot_ng_leak, total_runs),
+                "attack_compliance": _scenario_cluster_stats(scen_ng_comp, num_scenarios, tot_ng_comp, total_runs),
             },
             "secure_full": {
-                "secret_leak": _variant_stats(tot_full_leak, total_attempts),
-                "attack_compliance": _variant_stats(tot_full_comp, total_attempts),
+                "secret_leak": _scenario_cluster_stats(scen_full_leak, num_scenarios, tot_full_leak, total_runs),
+                "attack_compliance": _scenario_cluster_stats(scen_full_comp, num_scenarios, tot_full_comp, total_runs),
             },
         },
         "negative_controls_summary": {
@@ -316,27 +337,29 @@ def run_benchmark(runs_per_probe: int = 2, delay_seconds: float = 1.8, use_llm_j
 
 
 def render_markdown_report(summary: dict[str, Any]) -> str:
-    """Üçlü ablasyon ve %95 güven aralığı sonuçlarını Markdown tablosuna dönüştürür."""
     v = summary["variants"]
-    n_att = summary["total_attack_attempts"]
 
     def _fmt_stat(st: dict[str, Any]) -> str:
-        ci = st["wilson_95_ci_pct"]
-        return f"%{st['rate_pct']} ({st['count']}/{st['total']}, %95 GA: [%{ci[0]}, %{ci[1]}])"
+        ci = st["scenario_wilson_95_ci_pct"]
+        return (
+            f"%{st['scenario_rate_pct']} ({st['affected_scenarios']}/{st['total_scenarios']} senaryo, "
+            f"%95 GA: [%{ci[0]}, %{ci[1]}]; ham tekrar: {st['raw_hits']}/{st['raw_total_runs']})"
+        )
 
     lines = [
-        "# Üçlü Ablasyon ve LLM-Hakem Kırmızı Takım Kıyaslama Raporu",
+        "# Üçlü Ablasyon ve Ayrı LLM-Hakem Kırmızı Takım Kıyaslama Raporu",
         "",
         f"> **Metodolojik Not:** {summary['methodology_note']}",
         "",
-        f"- **Model:** `{summary['model']}` | **Deneme Sayısı:** `{n_att}` (`{summary['total_probes']}` probe x `N={summary['runs_per_probe']}`)",
+        f"- **Hedef Bot Modeli:** `{summary['target_model']}` | **Ayrı Hakem Modeli:** `{summary['judge_model']}`",
+        f"- **Tasarım:** `{summary['scenarios_count']}` senaryo × `{summary['runs_per_scenario']}` tekrar (tekrarlar bağımsız değildir)",
         "",
-        "## 1. Genel Özet ve %95 Wilson Güven Aralıkları",
+        "## 1. Senaryo Bazlı Özet (N=11) ve %95 Wilson Güven Aralıkları",
         "",
-        "| Mimari Varyant | Sır Sızıntı Oranı (Leak ASR) | Saldırı İsteğine Uyma (LLM-Hakem ACR) |",
+        "| Mimari Varyant | Sır Sızıntı Oranı (Senaryo Bazlı) | Saldırı İsteğine Uyma (LLM-Hakem) |",
         "| :--- | :---: | :---: |",
         f"| **1. Zafiyetli (`hr_bot.py`)** | {_fmt_stat(v['vulnerable']['secret_leak'])} | {_fmt_stat(v['vulnerable']['attack_compliance'])} |",
-        f"| **2. Güvenli — Girdi Kalkanı Kapalı (`enable_input_guard=False`)** | {_fmt_stat(v['secure_no_guard']['secret_leak'])} | {_fmt_stat(v['secure_no_guard']['attack_compliance'])} |",
+        f"| **2. Güvenli — Kalkan Kapalı (`enable_input_guard=False`)** | {_fmt_stat(v['secure_no_guard']['secret_leak'])} | {_fmt_stat(v['secure_no_guard']['attack_compliance'])} |",
         f"| **3. Güvenli — Tam Savunma (`enable_input_guard=True`)** | {_fmt_stat(v['secure_full']['secret_leak'])} | {_fmt_stat(v['secure_full']['attack_compliance'])} |",
         "",
         "## 2. Senaryo Bazlı Dağılım (Sızıntı % / LLM-Hakem Uyma %)",
@@ -356,8 +379,8 @@ def render_markdown_report(summary: dict[str, Any]) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Üçlü ablasyon ve LLM-hakem kırmızı takım kıyaslaması.")
-    parser.add_argument("--runs", type=int, default=2, help="Her saldırı probunun tekrarlanma sayısı (varsayılan: 2).")
+    parser = argparse.ArgumentParser(description="Üçlü ablasyon ve ayrı LLM-hakem kırmızı takım kıyaslaması.")
+    parser.add_argument("--runs", type=int, default=2, help="Her saldırı senaryosunun tekrarlanma sayısı.")
     parser.add_argument("--delay", type=float, default=1.6, help="API çağrıları arası bekleme süresi (sn).")
     parser.add_argument("--no-judge", action="store_true", help="LLM-hakem uyma metriğini devre dışı bırakır.")
     args = parser.parse_args(argv)
@@ -378,10 +401,10 @@ def main(argv: list[str] | None = None) -> int:
     md_path.parent.mkdir(parents=True, exist_ok=True)
     md_path.write_text(render_markdown_report(summary), encoding="utf-8")
 
-    print("\n" + "=" * 88)
+    print("\n" + "=" * 90)
     print(f"JSON Çıktısı : {cfg.benchmark_json_path}")
     print(f"Rapor Dosyası: {md_path}")
-    print("=" * 88)
+    print("=" * 90)
     return 0
 
 

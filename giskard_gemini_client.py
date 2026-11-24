@@ -153,7 +153,7 @@ class GeminiGiskardClient(LLMClient):
 
         last_exc: Exception | None = None
         for attempt in range(self.max_retries):
-            active_model = models_to_try[min(attempt, len(models_to_try) - 1)]
+            active_model = models_to_try[attempt % len(models_to_try)]
             try:
                 response = self._client.models.generate_content(
                     model=active_model,
