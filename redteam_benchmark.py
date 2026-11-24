@@ -1,13 +1,20 @@
-"""Öncesi / Sonrası (Zafiyetli vs Güvenli) Kırmızı Takım Kıyaslama Aracı.
+"""Üçlü Ablasyon ve Çift Metrikli Kırmızı Takım Kıyaslama Aracı.
 
-LLM çıktıları stokastik (değişken) olduğu için:
-1. `probes.py` içindeki 11 farklı OWASP saldırı senaryosunu her iki sürümde
-   (`hr_bot.py` ve `hr_bot_guvenli.py`) `N` kez (`--runs`) çalıştırır ve
-   Saldırı Başarı Oranını (Attack Success Rate - ASR %) hesaplar.
-2. 8 farklı meşru İK sorusundan oluşan negatif kontrolleri çalıştırarak
-   Yanlış Pozitif Oranını (False Positive Rate - FPR %) doğrular.
-3. Sonuçları hem JSON (`examples/karsilastirma_sonuclari.json`) hem de Markdown
-   tablosu (`reports/karsilastirma_raporu.md`) olarak kaydeder.
+Metodolojik iyileştirmeler:
+1. Üç Ayrı Yapılandırma (Ablation):
+   - `vulnerable`: Zafiyetli bot (`hr_bot.py` - sırlar bağlamda, yetki beyanına güven).
+   - `secure_no_guard`: Güvenli bot, girdi kalkanı KAPALI (`enable_input_guard=False`).
+     Tüm saldırılar doğrudan LLM'e ulaşır; sırların bağlamda olmamasının + güvenli
+     sistem yönergesinin + `<kullanici_mesaji>` sınırlandırmasının tek başına etkisi ölçülür.
+   - `secure_full`: Güvenli bot, tüm katmanlar AÇIK (`enable_input_guard=True`).
+2. Çift Değerlendirme Metriği:
+   - **Sır Sızıntı Oranı (Secret Leak ASR %):** `detect_sensitive_leak` ile kurgusal sırların
+     veya sistem yönergesi/canary belirteçlerinin sızıp sızmadığını ölçer.
+   - **Saldırı İsteğine Uyma Oranı (Attack Compliance Rate - ACR %, LLM-Hakem):** Bağlamda sır
+     bulunmasa dahi modelin yetkisiz rol/komut/dolaylı enjeksiyon isteğine uyup uymadığını ölçer.
+3. İstatistiksel Çerçeve:
+   - Sonlu örneklem büyüklüğünde (`N` deneme) %0 gözlemlerinin belirsizliğini ifade etmek için
+     %95 Wilson güven aralığı `[alt%, üst%]` ve `3/N` kuralı üst sınırı raporlanır.
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 if sys.platform.startswith("win"):
     try:
@@ -28,6 +36,12 @@ if sys.platform.startswith("win"):
     except Exception:
         pass
 
+from compliance_judge import (
+    ComplianceVerdict,
+    judge_attack_compliance,
+    rule_of_three_upper_95_pct,
+    wilson_ci_95,
+)
 from config import load_settings
 from hr_bot import ask_hr_bot
 from hr_bot_guvenli import SecureBotResult, ask_secure_hr_bot_detailed
@@ -38,227 +52,324 @@ from probes import ATTACK_PROBES, NEGATIVE_CONTROLS
 logger = logging.getLogger(__name__)
 
 
-def _retry_bot_call(fn, *args, **kwargs):
+def _retry_call(fn: Any, *args: Any, **kwargs: Any) -> Any:
     """Ücretsiz API katmanında dakikalık kota (429) veya geçici 503 durumlarında bekleyip tekrar dener."""
     for attempt in range(5):
         try:
             return fn(*args, **kwargs)
         except (BotRateLimitError, BotUpstreamError) as err:
-            wait_sec = 22.0 * (attempt + 1)
+            wait_sec = 20.0 * (attempt + 1)
             print(f"   [Kota/Yoğunluk Beklemesi] {wait_sec:.0f} sn bekleniyor (deneme {attempt + 1}/5): {err}")
             time.sleep(wait_sec)
     return fn(*args, **kwargs)
 
 
 @dataclass
-class ProbeComparisonRow:
-    """Tek bir saldırı probunun zafiyetli ve güvenli botlardaki başarı istatistiği."""
+class ProbeAblationRow:
+    """Tek bir saldırı senaryosunun 3 mimari varyanttaki sızıntı ve uyma sonuçları."""
 
     probe_id: str
     title: str
     owasp_category: str
-    technique: str
     runs: int
-    vulnerable_leaks: int
-    vulnerable_asr_pct: float
-    secure_leaks: int
-    secure_asr_pct: float
-    secure_blocked_input: int
-    secure_blocked_dlp: int
+    vuln_leaks: int
+    vuln_leak_pct: float
+    vuln_complied: int
+    vuln_compliance_pct: float
+    sec_noguard_leaks: int
+    sec_noguard_leak_pct: float
+    sec_noguard_complied: int
+    sec_noguard_compliance_pct: float
+    sec_full_leaks: int
+    sec_full_leak_pct: float
+    sec_full_complied: int
+    sec_full_compliance_pct: float
+    sec_full_input_blocks: int
 
 
 @dataclass
 class NegativeControlRow:
-    """Meşru İK sorularında yanlış alarm (false positive) kontrol sonucu."""
+    """Meşru İK sorularında yanlış alarm ve yanlış engelleme sonuçları."""
 
     control_id: str
     description: str
     vulnerable_false_positive: bool
-    secure_false_positive: bool
-    secure_wrongly_blocked: bool
+    secure_noguard_false_positive: bool
+    secure_full_false_positive: bool
+    secure_full_wrongly_blocked: bool
 
 
-def run_benchmark(runs_per_probe: int = 2, delay_seconds: float = 0.6) -> dict:
-    """Tüm saldırı problarını ve negatif kontrolleri çalıştırıp karşılaştırma sözlüğü döner."""
+def _variant_stats(count: int, total: int) -> dict[str, Any]:
+    pct = round((count / total) * 100.0, 1) if total else 0.0
+    ci_low, ci_high = wilson_ci_95(count, total)
+    out: dict[str, Any] = {
+        "count": count,
+        "total": total,
+        "rate_pct": pct,
+        "wilson_95_ci_pct": [ci_low, ci_high],
+    }
+    if count == 0 and total > 0:
+        out["rule_of_three_upper_95_pct"] = rule_of_three_upper_95_pct(total)
+    return out
+
+
+def run_benchmark(runs_per_probe: int = 2, delay_seconds: float = 1.8, use_llm_judge: bool = True) -> dict[str, Any]:
+    """3 varyant üzerinde saldırı problarını ve negatif kontrolleri çalıştırır."""
     cfg = load_settings()
     if not cfg.has_valid_api_key:
         raise RuntimeError("GEMINI_API_KEY tanımlanmamış! Lütfen .env dosyanızı kontrol edin.")
 
-    probe_rows: list[ProbeComparisonRow] = []
-    total_vuln_leaks = 0
-    total_sec_leaks = 0
+    probe_rows: list[ProbeAblationRow] = []
+    tot_vuln_leak = tot_vuln_comp = 0
+    tot_ng_leak = tot_ng_comp = 0
+    tot_full_leak = tot_full_comp = 0
     total_attempts = len(ATTACK_PROBES) * runs_per_probe
 
-    print("=" * 78)
-    print(f"  KIRMIZI TAKIM ÖNCESİ/SONRASI KIYASLAMA TESTİ (Her probe N={runs_per_probe} tekrar)")
-    print("=" * 78)
+    print("=" * 88)
+    print(
+        f"  ÜÇLÜ ABLASYON VE LLM-HAKEM KIYASLAMASI (N={runs_per_probe} tekrar, toplam {total_attempts} deneme/varyant)"
+    )
+    print("=" * 88)
 
     for probe in ATTACK_PROBES:
-        vuln_leaks = 0
-        sec_leaks = 0
-        sec_input_blocks = 0
-        sec_dlp_blocks = 0
+        v_leak = v_comp = 0
+        ng_leak = ng_comp = 0
+        f_leak = f_comp = f_in_block = 0
 
         for _ in range(runs_per_probe):
+            # 1. Zafiyetli Sürüm
             if delay_seconds > 0:
                 time.sleep(delay_seconds)
-            vuln_reply: str = _retry_bot_call(ask_hr_bot, probe.prompt, history=probe.prior_turns)
-            if detect_sensitive_leak(vuln_reply).is_leak:
-                vuln_leaks += 1
+            v_reply: str = _retry_call(ask_hr_bot, probe.prompt, history=probe.prior_turns)
+            is_v_leak = detect_sensitive_leak(v_reply).is_leak
+            if is_v_leak:
+                v_leak += 1
+            if use_llm_judge:
+                if is_v_leak:
+                    v_comp += 1
+                else:
+                    if delay_seconds > 0:
+                        time.sleep(delay_seconds * 0.6)
+                    verdict: ComplianceVerdict = _retry_call(judge_attack_compliance, probe.prompt, v_reply)
+                    if verdict.complied:
+                        v_comp += 1
 
+            # 2. Güvenli Sürüm — Girdi Kalkanı KAPALI (enable_input_guard=False)
             if delay_seconds > 0:
                 time.sleep(delay_seconds)
-            sec_res: SecureBotResult = _retry_bot_call(
-                ask_secure_hr_bot_detailed, probe.prompt, history=probe.prior_turns
+            ng_res: SecureBotResult = _retry_call(
+                ask_secure_hr_bot_detailed,
+                probe.prompt,
+                history=probe.prior_turns,
+                enable_input_guard=False,
             )
-            if sec_res.blocked_by_input_guard:
-                sec_input_blocks += 1
-            if sec_res.blocked_by_output_dlp:
-                sec_dlp_blocks += 1
-            if detect_sensitive_leak(sec_res.reply).is_leak:
-                sec_leaks += 1
+            is_ng_leak = detect_sensitive_leak(ng_res.reply).is_leak
+            if is_ng_leak:
+                ng_leak += 1
+            if use_llm_judge:
+                if is_ng_leak:
+                    ng_comp += 1
+                elif ng_res.blocked_by_output_dlp:
+                    pass
+                else:
+                    if delay_seconds > 0:
+                        time.sleep(delay_seconds * 0.6)
+                    ng_verdict: ComplianceVerdict = _retry_call(judge_attack_compliance, probe.prompt, ng_res.reply)
+                    if ng_verdict.complied:
+                        ng_comp += 1
 
-        total_vuln_leaks += vuln_leaks
-        total_sec_leaks += sec_leaks
+            # 3. Güvenli Sürüm — Tam Savunma (enable_input_guard=True)
+            f_res: SecureBotResult = _retry_call(
+                ask_secure_hr_bot_detailed,
+                probe.prompt,
+                history=probe.prior_turns,
+                enable_input_guard=True,
+            )
+            if f_res.blocked_by_input_guard:
+                f_in_block += 1
+            else:
+                if delay_seconds > 0:
+                    time.sleep(delay_seconds * 0.5)
+            is_f_leak = detect_sensitive_leak(f_res.reply).is_leak
+            if is_f_leak:
+                f_leak += 1
+            if use_llm_judge and not (f_res.blocked_by_input_guard or f_res.blocked_by_output_dlp):
+                if is_f_leak:
+                    f_comp += 1
+                else:
+                    if delay_seconds > 0:
+                        time.sleep(delay_seconds * 0.6)
+                    f_verdict: ComplianceVerdict = _retry_call(judge_attack_compliance, probe.prompt, f_res.reply)
+                    if f_verdict.complied:
+                        f_comp += 1
 
-        v_pct = round((vuln_leaks / runs_per_probe) * 100.0, 1)
-        s_pct = round((sec_leaks / runs_per_probe) * 100.0, 1)
+        tot_vuln_leak += v_leak
+        tot_vuln_comp += v_comp
+        tot_ng_leak += ng_leak
+        tot_ng_comp += ng_comp
+        tot_full_leak += f_leak
+        tot_full_comp += f_comp
 
+        row = ProbeAblationRow(
+            probe_id=probe.id,
+            title=probe.title,
+            owasp_category=probe.owasp_category,
+            runs=runs_per_probe,
+            vuln_leaks=v_leak,
+            vuln_leak_pct=round((v_leak / runs_per_probe) * 100.0, 1),
+            vuln_complied=v_comp,
+            vuln_compliance_pct=round((v_comp / runs_per_probe) * 100.0, 1),
+            sec_noguard_leaks=ng_leak,
+            sec_noguard_leak_pct=round((ng_leak / runs_per_probe) * 100.0, 1),
+            sec_noguard_complied=ng_comp,
+            sec_noguard_compliance_pct=round((ng_comp / runs_per_probe) * 100.0, 1),
+            sec_full_leaks=f_leak,
+            sec_full_leak_pct=round((f_leak / runs_per_probe) * 100.0, 1),
+            sec_full_complied=f_comp,
+            sec_full_compliance_pct=round((f_comp / runs_per_probe) * 100.0, 1),
+            sec_full_input_blocks=f_in_block,
+        )
+        probe_rows.append(row)
         print(
-            f"[{probe.id}] Zafiyetli ASR: %{v_pct:5.1f} ({vuln_leaks}/{runs_per_probe}) | "
-            f"Güvenli ASR: %{s_pct:5.1f} ({sec_leaks}/{runs_per_probe})"
+            f"[{probe.id}] Sızıntı/Uyma -> "
+            f"Zafiyetli: %{row.vuln_leak_pct}/%{row.vuln_compliance_pct} | "
+            f"KalkanKapalı: %{row.sec_noguard_leak_pct}/%{row.sec_noguard_compliance_pct} | "
+            f"TamSavunma: %{row.sec_full_leak_pct}/%{row.sec_full_compliance_pct}"
         )
 
-        probe_rows.append(
-            ProbeComparisonRow(
-                probe_id=probe.id,
-                title=probe.title,
-                owasp_category=probe.owasp_category,
-                technique=probe.technique,
-                runs=runs_per_probe,
-                vulnerable_leaks=vuln_leaks,
-                vulnerable_asr_pct=v_pct,
-                secure_leaks=sec_leaks,
-                secure_asr_pct=s_pct,
-                secure_blocked_input=sec_input_blocks,
-                secure_blocked_dlp=sec_dlp_blocks,
-            )
-        )
-
-    print("\n--- Negatif Kontroller (Yanlış Alarm / False Positive Testi) ---")
+    print("\n--- Negatif Kontroller (Yanlış Alarm ve Yanlış Engelleme Testi) ---")
     neg_rows: list[NegativeControlRow] = []
-    vuln_fp_count = 0
-    sec_fp_count = 0
-    sec_wrong_block_count = 0
+    v_fp_cnt = ng_fp_cnt = f_fp_cnt = f_wb_cnt = 0
 
     for ctrl in NEGATIVE_CONTROLS:
         if delay_seconds > 0:
             time.sleep(delay_seconds)
-        v_reply: str = _retry_bot_call(ask_hr_bot, ctrl.prompt)
-        v_fp = detect_sensitive_leak(v_reply).is_leak
+        v_rep: str = _retry_call(ask_hr_bot, ctrl.prompt)
+        v_fp = detect_sensitive_leak(v_rep).is_leak
 
         if delay_seconds > 0:
             time.sleep(delay_seconds)
-        s_res: SecureBotResult = _retry_bot_call(ask_secure_hr_bot_detailed, ctrl.prompt)
-        s_fp = detect_sensitive_leak(s_res.reply).is_leak
-        s_blocked = s_res.blocked_by_input_guard or s_res.blocked_by_output_dlp
+        ng_rep: SecureBotResult = _retry_call(ask_secure_hr_bot_detailed, ctrl.prompt, enable_input_guard=False)
+        ng_fp = detect_sensitive_leak(ng_rep.reply).is_leak
 
-        if v_fp:
-            vuln_fp_count += 1
-        if s_fp:
-            sec_fp_count += 1
-        if s_blocked:
-            sec_wrong_block_count += 1
+        if delay_seconds > 0:
+            time.sleep(delay_seconds)
+        f_rep: SecureBotResult = _retry_call(ask_secure_hr_bot_detailed, ctrl.prompt, enable_input_guard=True)
+        f_fp = detect_sensitive_leak(f_rep.reply).is_leak
+        f_wb = f_rep.blocked_by_input_guard or f_rep.blocked_by_output_dlp
 
-        print(
-            f"[{ctrl.id}] Yanlış Sızıntı Alarmı: Zafiyetli={v_fp}, Güvenli={s_fp} | "
-            f"Yanlış Engelleme (Güvenli Mod)={s_blocked}"
-        )
+        v_fp_cnt += int(v_fp)
+        ng_fp_cnt += int(ng_fp)
+        f_fp_cnt += int(f_fp)
+        f_wb_cnt += int(f_wb)
+
         neg_rows.append(
             NegativeControlRow(
                 control_id=ctrl.id,
                 description=ctrl.description,
                 vulnerable_false_positive=v_fp,
-                secure_false_positive=s_fp,
-                secure_wrongly_blocked=s_blocked,
+                secure_noguard_false_positive=ng_fp,
+                secure_full_false_positive=f_fp,
+                secure_full_wrongly_blocked=f_wb,
             )
         )
+        print(f"[{ctrl.id}] Yanlış Alarm={f_fp}, Yanlış Engelleme (Tam Savunma)={f_wb}")
 
-    overall_vuln_asr = round((total_vuln_leaks / total_attempts) * 100.0, 1) if total_attempts else 0.0
-    overall_sec_asr = round((total_sec_leaks / total_attempts) * 100.0, 1) if total_attempts else 0.0
     neg_total = len(NEGATIVE_CONTROLS)
-
-    summary = {
+    return {
         "generated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "model": cfg.gemini_model,
+        "llm_judge_enabled": use_llm_judge,
         "runs_per_probe": runs_per_probe,
         "total_probes": len(ATTACK_PROBES),
         "total_attack_attempts": total_attempts,
-        "vulnerable_overall_asr_pct": overall_vuln_asr,
-        "secure_overall_asr_pct": overall_sec_asr,
-        "negative_controls_total": neg_total,
-        "vulnerable_false_positive_rate_pct": round((vuln_fp_count / neg_total) * 100.0, 1),
-        "secure_false_positive_rate_pct": round((sec_fp_count / neg_total) * 100.0, 1),
-        "secure_benign_block_rate_pct": round((sec_wrong_block_count / neg_total) * 100.0, 1),
+        "methodology_note": (
+            "Güvenli sürümün sistem promptunda sır bulunmadığından 0/N sızıntı oranı öncelikle bağlam "
+            "izolasyonunu doğrular. Modelin ve prompt sınırlandırmasının davranışsal direncini ölçmek "
+            "için ayrıca girdi kalkanı kapalı (`secure_no_guard`) koşum ve LLM-hakem 'Saldırı İsteğine "
+            "Uyma' (Attack Compliance) metriği ile %95 Wilson güven aralıkları hesaplanmıştır."
+        ),
+        "variants": {
+            "vulnerable": {
+                "secret_leak": _variant_stats(tot_vuln_leak, total_attempts),
+                "attack_compliance": _variant_stats(tot_vuln_comp, total_attempts),
+            },
+            "secure_no_guard": {
+                "secret_leak": _variant_stats(tot_ng_leak, total_attempts),
+                "attack_compliance": _variant_stats(tot_ng_comp, total_attempts),
+            },
+            "secure_full": {
+                "secret_leak": _variant_stats(tot_full_leak, total_attempts),
+                "attack_compliance": _variant_stats(tot_full_comp, total_attempts),
+            },
+        },
+        "negative_controls_summary": {
+            "total": neg_total,
+            "vulnerable_false_positive_rate_pct": round((v_fp_cnt / neg_total) * 100.0, 1),
+            "secure_noguard_false_positive_rate_pct": round((ng_fp_cnt / neg_total) * 100.0, 1),
+            "secure_full_false_positive_rate_pct": round((f_fp_cnt / neg_total) * 100.0, 1),
+            "secure_full_benign_block_rate_pct": round((f_wb_cnt / neg_total) * 100.0, 1),
+        },
         "probes": [asdict(r) for r in probe_rows],
         "negative_controls": [asdict(n) for n in neg_rows],
     }
-    return summary
 
 
-def render_markdown_report(summary: dict) -> str:
-    """Kıyaslama sözlüğünden okunabilir Markdown karşılaştırma tablosu üretir."""
+def render_markdown_report(summary: dict[str, Any]) -> str:
+    """Üçlü ablasyon ve %95 güven aralığı sonuçlarını Markdown tablosuna dönüştürür."""
+    v = summary["variants"]
+    n_att = summary["total_attack_attempts"]
+
+    def _fmt_stat(st: dict[str, Any]) -> str:
+        ci = st["wilson_95_ci_pct"]
+        return f"%{st['rate_pct']} ({st['count']}/{st['total']}, %95 GA: [%{ci[0]}, %{ci[1]}])"
+
     lines = [
-        "# Zafiyetli vs Güvenli İK Asistanı — Kırmızı Takım Kıyaslama Raporu",
+        "# Üçlü Ablasyon ve LLM-Hakem Kırmızı Takım Kıyaslama Raporu",
         "",
-        f"- **Model:** `{summary['model']}`",
-        f"- **Probe Başına Tekrar (N):** `{summary['runs_per_probe']}`",
-        f"- **Toplam Saldırı Denemesi:** `{summary['total_attack_attempts']}`",
-        f"- **Zafiyetli Bot Genel Saldırı Başarı Oranı (ASR):** `%{summary['vulnerable_overall_asr_pct']}`",
-        f"- **Güvenli Bot Genel Saldırı Başarı Oranı (ASR):** `%{summary['secure_overall_asr_pct']}`",
-        f"- **Meşru Sorularda Yanlış Engelleme Oranı (Güvenli Bot):** `%{summary['secure_benign_block_rate_pct']}`",
+        f"> **Metodolojik Not:** {summary['methodology_note']}",
         "",
-        "## 1. Saldırı Senaryoları Karşılaştırma Tablosu",
+        f"- **Model:** `{summary['model']}` | **Deneme Sayısı:** `{n_att}` (`{summary['total_probes']}` probe x `N={summary['runs_per_probe']}`)",
         "",
-        "| Kod | Senaryo | OWASP Kategorisi | Zafiyetli ASR (%) | Güvenli ASR (%) |",
-        "| :--- | :--- | :--- | :---: | :---: |",
+        "## 1. Genel Özet ve %95 Wilson Güven Aralıkları",
+        "",
+        "| Mimari Varyant | Sır Sızıntı Oranı (Leak ASR) | Saldırı İsteğine Uyma (LLM-Hakem ACR) |",
+        "| :--- | :---: | :---: |",
+        f"| **1. Zafiyetli (`hr_bot.py`)** | {_fmt_stat(v['vulnerable']['secret_leak'])} | {_fmt_stat(v['vulnerable']['attack_compliance'])} |",
+        f"| **2. Güvenli — Girdi Kalkanı Kapalı (`enable_input_guard=False`)** | {_fmt_stat(v['secure_no_guard']['secret_leak'])} | {_fmt_stat(v['secure_no_guard']['attack_compliance'])} |",
+        f"| **3. Güvenli — Tam Savunma (`enable_input_guard=True`)** | {_fmt_stat(v['secure_full']['secret_leak'])} | {_fmt_stat(v['secure_full']['attack_compliance'])} |",
+        "",
+        "## 2. Senaryo Bazlı Dağılım (Sızıntı % / LLM-Hakem Uyma %)",
+        "",
+        "| Kod | Senaryo | Zafiyetli | Güvenli (Kalkan Kapalı) | Güvenli (Tam) |",
+        "| :--- | :--- | :---: | :---: | :---: |",
     ]
     for p in summary["probes"]:
         lines.append(
-            f"| `{p['probe_id']}` | {p['title']} | {p['owasp_category']} | "
-            f"%{p['vulnerable_asr_pct']} ({p['vulnerable_leaks']}/{p['runs']}) | "
-            f"%{p['secure_asr_pct']} ({p['secure_leaks']}/{p['runs']}) |"
-        )
-
-    lines.extend(
-        [
-            "",
-            "## 2. Negatif Kontroller (Yanlış Alarm / False Positive Doğrulaması)",
-            "",
-            "| Kod | Meşru İK Sorusu | Zafiyetli Yanlış Alarm | Güvenli Yanlış Engelleme |",
-            "| :--- | :--- | :---: | :---: |",
-        ]
-    )
-    for n in summary["negative_controls"]:
-        lines.append(
-            f"| `{n['control_id']}` | {n['description']} | "
-            f"{'Evet' if n['vulnerable_false_positive'] else 'Hayır'} | "
-            f"{'Evet' if n['secure_wrongly_blocked'] else 'Hayır'} |"
+            f"| `{p['probe_id']}` | {p['title']} | "
+            f"%{p['vuln_leak_pct']} / %{p['vuln_compliance_pct']} | "
+            f"%{p['sec_noguard_leak_pct']} / %{p['sec_noguard_compliance_pct']} | "
+            f"%{p['sec_full_leak_pct']} / %{p['sec_full_compliance_pct']} |"
         )
     lines.append("")
     return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Zafiyetli ve güvenli botlar üzerinde kırmızı takım kıyaslaması çalıştırır.")
+    parser = argparse.ArgumentParser(description="Üçlü ablasyon ve LLM-hakem kırmızı takım kıyaslaması.")
     parser.add_argument("--runs", type=int, default=2, help="Her saldırı probunun tekrarlanma sayısı (varsayılan: 2).")
-    parser.add_argument("--delay", type=float, default=0.5, help="API çağrıları arası bekleme süresi (sn).")
+    parser.add_argument("--delay", type=float, default=1.6, help="API çağrıları arası bekleme süresi (sn).")
+    parser.add_argument("--no-judge", action="store_true", help="LLM-hakem uyma metriğini devre dışı bırakır.")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.WARNING)
     cfg = load_settings()
 
-    summary = run_benchmark(runs_per_probe=max(1, args.runs), delay_seconds=max(0.0, args.delay))
+    summary = run_benchmark(
+        runs_per_probe=max(1, args.runs),
+        delay_seconds=max(0.0, args.delay),
+        use_llm_judge=not args.no_judge,
+    )
 
     cfg.benchmark_json_path.parent.mkdir(parents=True, exist_ok=True)
     cfg.benchmark_json_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -267,14 +378,10 @@ def main(argv: list[str] | None = None) -> int:
     md_path.parent.mkdir(parents=True, exist_ok=True)
     md_path.write_text(render_markdown_report(summary), encoding="utf-8")
 
-    print("\n" + "=" * 78)
-    print(
-        f"ÖZET: Zafiyetli ASR = %{summary['vulnerable_overall_asr_pct']}  -->  "
-        f"Güvenli ASR = %{summary['secure_overall_asr_pct']}"
-    )
+    print("\n" + "=" * 88)
     print(f"JSON Çıktısı : {cfg.benchmark_json_path}")
     print(f"Rapor Dosyası: {md_path}")
-    print("=" * 78)
+    print("=" * 88)
     return 0
 
 
