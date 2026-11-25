@@ -31,6 +31,7 @@ if sys.platform.startswith("win"):
 
 import giskard
 import pandas as pd
+from giskard.models.function import PredictionFunctionModel
 
 from config import load_settings
 from giskard_gemini_client import configure_giskard_gemini
@@ -155,7 +156,7 @@ def run_giskard_scan(
     )
 
     print(f"[2/4] Hedef model Giskard sarmalayıcısına alınıyor: {model_title}")
-    giskard_model = giskard.Model(
+    giskard_model = PredictionFunctionModel(
         model=model_predict,
         model_type="text_generation",
         name=model_title,
