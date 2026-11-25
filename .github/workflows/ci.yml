@@ -11,6 +11,7 @@ jobs:
     name: Çekirdek Sunucu ve Testler (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         # requirements.txt ve requirements-dev.txt Python 3.10 - 3.12 destekler
         python-version: ["3.10", "3.11", "3.12"]
@@ -42,6 +43,7 @@ jobs:
     name: Giskard Tarayıcı Uyumluluğu (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         # requirements-scan.txt (giskard==2.19.2 -> scipy<1.12.0, numpy<2.0) yalnızca 3.10 ve 3.11 destekler
         python-version: ["3.10", "3.11"]
