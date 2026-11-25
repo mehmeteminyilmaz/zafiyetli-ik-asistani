@@ -37,7 +37,7 @@ jobs:
       - name: Mock'lu birim ve API testlerini çalıştır
         env:
           GEMINI_API_KEY: ""
-        run: pytest -v
+        run: python -m pytest -v
 
   giskard-scanner-compat:
     name: Giskard Tarayıcı Uyumluluğu (Python ${{ matrix.python-version }})
