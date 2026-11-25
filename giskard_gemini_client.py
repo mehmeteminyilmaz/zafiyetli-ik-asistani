@@ -72,12 +72,13 @@ class GeminiGiskardClient(LLMClient):
         model: str | None = None,
         fallback_model: str | None = None,
         request_delay_seconds: float | None = None,
-        max_retries: int = 6,
+        max_retries: int = 15,
         genai_client: genai.Client | None = None,
     ) -> None:
         cfg: Settings = load_settings()
         self.model = (model or cfg.gemini_model).strip()
         self.fallback_model = (fallback_model or cfg.gemini_fallback_model).strip()
+        self._is_live_client = genai_client is None
         self.request_delay_seconds = (
             cfg.scan_request_delay_seconds if request_delay_seconds is None else request_delay_seconds
         )
@@ -150,10 +151,16 @@ class GeminiGiskardClient(LLMClient):
         models_to_try = [self.model]
         if self.fallback_model and self.fallback_model not in models_to_try:
             models_to_try.append(self.fallback_model)
+        if self._is_live_client and "gemini-flash-lite-latest" not in models_to_try:
+            models_to_try.append("gemini-flash-lite-latest")
 
         last_exc: Exception | None = None
         for attempt in range(self.max_retries):
-            active_model = models_to_try[attempt % len(models_to_try)]
+            # Flash-Lite havuzu uzun süreli 503 yoğunluğuna girerse geç denemelerde farklı havuzdaki 3.5-flash'ı dene
+            if self._is_live_client and attempt in {6, 11}:
+                active_model = "gemini-3.5-flash"
+            else:
+                active_model = models_to_try[attempt % len(models_to_try)]
             try:
                 response = self._client.models.generate_content(
                     model=active_model,
@@ -179,9 +186,10 @@ class GeminiGiskardClient(LLMClient):
                 last_exc = err
                 code = getattr(err, "code", None)
                 if code in {429, 500, 502, 503, 504}:
-                    backoff = 15.0 * (attempt + 1) if code == 429 else min(3.0 * (attempt + 1), 15.0)
+                    backoff = 15.0 * (attempt + 1) if code == 429 else min(5.0 * (attempt + 1), 25.0)
                     logger.warning(
-                        "Giskard Gemini istemcisi geçici hata aldı (kod=%s, deneme=%d/%d). %.1fs bekleniyor...",
+                        "Giskard Gemini istemcisi geçici hata aldı (model=%s, kod=%s, deneme=%d/%d). %.1fs bekleniyor...",
+                        active_model,
                         code,
                         attempt + 1,
                         self.max_retries,

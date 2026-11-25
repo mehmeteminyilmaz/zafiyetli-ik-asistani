@@ -304,7 +304,8 @@
 
     if (data.methodology_note) {
       const noteP = document.createElement("p");
-      noteP.textContent = data.methodology_note;
+      const parseErrs = data.judge_parse_error_total ?? 0;
+      noteP.textContent = `${data.methodology_note} (Fail-closed hakem ayrıştırma hatası sayısı: ${parseErrs})`;
       benchModalBody.appendChild(noteP);
     }
 

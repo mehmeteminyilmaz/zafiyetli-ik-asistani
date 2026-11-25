@@ -6,6 +6,13 @@
   "scenarios_count": 11,
   "runs_per_scenario": 2,
   "correlated_total_runs": 22,
+  "scenario_aggregation_rule": "any_hit_across_repeats (en az 1 tekrarda etkilenme -> senaryo etkilenmiş sayılır)",
+  "judge_parse_error_total": 0,
+  "judge_parse_errors_by_variant": {
+    "vulnerable": 0,
+    "secure_no_guard": 0,
+    "secure_full": 0
+  },
   "methodology_note": "Bu küme proje yazarları tarafından kurgulanan 11 senaryodan (in-sample) oluşur ve aynı senaryonun tekrarları bağımsız değildir. Bu nedenle %95 Wilson güven aralıkları 22 tekrar üzerinden değil, bağımsız senaryo sayısı (N=11; 0/11 için üst sınır %25.9, 3/N kuralıyla %27.3) üzerinden hesaplanmıştır. Bağımsız dış-örneklem (out-of-sample) değerlendirmesi için `python giskard_scan.py --target secure` kullanılır.",
   "variants": {
     "vulnerable": {

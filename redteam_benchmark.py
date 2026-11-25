@@ -82,6 +82,7 @@ class ProbeAblationRow:
     sec_full_complied: int
     sec_full_compliance_pct: float
     sec_full_input_blocks: int
+    judge_parse_errors: int = 0
 
 
 @dataclass
@@ -135,6 +136,8 @@ def run_benchmark(runs_per_probe: int = 2, delay_seconds: float = 1.6, use_llm_j
     scen_ng_leak = scen_ng_comp = 0
     scen_full_leak = scen_full_comp = 0
 
+    parse_err_vuln = parse_err_ng = parse_err_full = 0
+
     num_scenarios = len(ATTACK_PROBES)
     total_runs = num_scenarios * runs_per_probe
 
@@ -149,6 +152,7 @@ def run_benchmark(runs_per_probe: int = 2, delay_seconds: float = 1.6, use_llm_j
         v_leak = v_comp = 0
         ng_leak = ng_comp = 0
         f_leak = f_comp = f_in_block = 0
+        row_parse_errs = 0
 
         for _ in range(runs_per_probe):
             # 1. Zafiyetli Sürüm
@@ -163,8 +167,11 @@ def run_benchmark(runs_per_probe: int = 2, delay_seconds: float = 1.6, use_llm_j
                     v_comp += 1
                 else:
                     if delay_seconds > 0:
-                        time.sleep(delay_seconds * 0.6)
+                        time.sleep(delay_seconds * 0.4)
                     verdict: ComplianceVerdict = _retry_call(judge_attack_compliance, probe.prompt, v_reply)
+                    if verdict.parse_error:
+                        parse_err_vuln += 1
+                        row_parse_errs += 1
                     if verdict.complied:
                         v_comp += 1
 
@@ -185,8 +192,11 @@ def run_benchmark(runs_per_probe: int = 2, delay_seconds: float = 1.6, use_llm_j
                     ng_comp += 1
                 elif not ng_res.blocked_by_output_dlp:
                     if delay_seconds > 0:
-                        time.sleep(delay_seconds * 0.6)
+                        time.sleep(delay_seconds * 0.4)
                     ng_verdict: ComplianceVerdict = _retry_call(judge_attack_compliance, probe.prompt, ng_res.reply)
+                    if ng_verdict.parse_error:
+                        parse_err_ng += 1
+                        row_parse_errs += 1
                     if ng_verdict.complied:
                         ng_comp += 1
 
@@ -201,7 +211,7 @@ def run_benchmark(runs_per_probe: int = 2, delay_seconds: float = 1.6, use_llm_j
                 f_in_block += 1
             else:
                 if delay_seconds > 0:
-                    time.sleep(delay_seconds * 0.5)
+                    time.sleep(delay_seconds * 0.4)
             is_f_leak = detect_sensitive_leak(f_res.reply).is_leak
             if is_f_leak:
                 f_leak += 1
@@ -210,8 +220,11 @@ def run_benchmark(runs_per_probe: int = 2, delay_seconds: float = 1.6, use_llm_j
                     f_comp += 1
                 else:
                     if delay_seconds > 0:
-                        time.sleep(delay_seconds * 0.6)
+                        time.sleep(delay_seconds * 0.4)
                     f_verdict: ComplianceVerdict = _retry_call(judge_attack_compliance, probe.prompt, f_res.reply)
+                    if f_verdict.parse_error:
+                        parse_err_full += 1
+                        row_parse_errs += 1
                     if f_verdict.complied:
                         f_comp += 1
 
@@ -247,6 +260,7 @@ def run_benchmark(runs_per_probe: int = 2, delay_seconds: float = 1.6, use_llm_j
             sec_full_complied=f_comp,
             sec_full_compliance_pct=round((f_comp / runs_per_probe) * 100.0, 1),
             sec_full_input_blocks=f_in_block,
+            judge_parse_errors=row_parse_errs,
         )
         probe_rows.append(row)
         print(
@@ -303,6 +317,13 @@ def run_benchmark(runs_per_probe: int = 2, delay_seconds: float = 1.6, use_llm_j
         "scenarios_count": num_scenarios,
         "runs_per_scenario": runs_per_probe,
         "correlated_total_runs": total_runs,
+        "scenario_aggregation_rule": "any_hit_across_repeats (en az 1 tekrarda etkilenme -> senaryo etkilenmiş sayılır)",
+        "judge_parse_error_total": parse_err_vuln + parse_err_ng + parse_err_full,
+        "judge_parse_errors_by_variant": {
+            "vulnerable": parse_err_vuln,
+            "secure_no_guard": parse_err_ng,
+            "secure_full": parse_err_full,
+        },
         "methodology_note": (
             "Bu küme proje yazarları tarafından kurgulanan 11 senaryodan (in-sample) oluşur ve "
             "aynı senaryonun tekrarları bağımsız değildir. Bu nedenle %95 Wilson güven aralıkları "
@@ -352,7 +373,8 @@ def render_markdown_report(summary: dict[str, Any]) -> str:
         f"> **Metodolojik Not:** {summary['methodology_note']}",
         "",
         f"- **Hedef Bot Modeli:** `{summary['target_model']}` | **Ayrı Hakem Modeli:** `{summary['judge_model']}`",
-        f"- **Tasarım:** `{summary['scenarios_count']}` senaryo × `{summary['runs_per_scenario']}` tekrar (tekrarlar bağımsız değildir)",
+        f"- **Tasarım:** `{summary['scenarios_count']}` senaryo × `{summary['runs_per_scenario']}` tekrar (tekrarlar bağımsız değildir; toplulaştırma kuralı: en az 1 tekrarda etkilenme)",
+        f"- **Fail-Closed Hakem Ayrıştırma Hatası Sayısı:** `{summary.get('judge_parse_error_total', 0)}`",
         "",
         "## 1. Senaryo Bazlı Özet (N=11) ve %95 Wilson Güven Aralıkları",
         "",

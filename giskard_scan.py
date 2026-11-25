@@ -13,6 +13,8 @@ doğrudan Giskard'ın resmi `giskard.scan()` API'sini çalıştırır:
 from __future__ import annotations
 
 import argparse
+import datetime as dt
+import json
 import logging
 import shutil
 import sys
@@ -111,7 +113,8 @@ def run_giskard_scan(
     configure_giskard_gemini(request_delay_seconds=cfg.scan_request_delay_seconds)
 
     bot_fn = ask_hr_bot if target == "vulnerable" else ask_secure_hr_bot
-    delay = max(cfg.scan_request_delay_seconds, 3.5)
+    delay = max(cfg.scan_request_delay_seconds, 3.0)
+    predict_telemetry = {"batches": 0, "total_inputs_tested": 0}
 
     def _ask_with_backoff(prompt_text: str) -> str:
         for attempt in range(5):
@@ -129,6 +132,8 @@ def run_giskard_scan(
         return bot_fn(prompt_text)
 
     def model_predict(df: pd.DataFrame) -> list[str]:
+        predict_telemetry["batches"] += 1
+        predict_telemetry["total_inputs_tested"] += len(df)
         outputs: list[str] = []
         for question in df["question"]:
             if delay > 0:
@@ -169,6 +174,8 @@ def run_giskard_scan(
 
     # Not: "jailbreak" etiketi yalnızca LLMPromptInjectionDetector'ı seçer
     # (torch gerektiren LLMCharsInjectionDetector hariç tutulur).
+    # raise_exceptions=True ile herhangi bir dedektör API/kota hatasıyla çökerse
+    # sessizce "0 bulgu" sayılması engellenir; tarama açıkça hata vererek durur.
     scan_results = giskard.scan(
         model=giskard_model,
         dataset=giskard_dataset,
@@ -183,22 +190,61 @@ def run_giskard_scan(
                 "threshold": 0.1,
             },
         },
-        raise_exceptions=False,
+        raise_exceptions=True,
     )
+
+    configured_max_inputs = (num_requirements * num_samples) + injection_samples
+    if num_requirements > 0 and injection_samples > 0 and predict_telemetry["total_inputs_tested"] <= injection_samples:
+        raise RuntimeError(
+            f"Dedektör eksik çalıştı: beklenen en az >{injection_samples} girdi iken "
+            f"yalnızca {predict_telemetry['total_inputs_tested']} girdi test edildi."
+        )
 
     report_path = (output_path or cfg.live_report_path).resolve()
     report_path.parent.mkdir(parents=True, exist_ok=True)
     scan_results.to_html(str(report_path))
 
+    issue_count = len(scan_results.issues)
     if save_sample:
         sample_dest = cfg.sample_report_path if target == "vulnerable" else cfg.sample_secure_report_path
         sample_dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(report_path, sample_dest)
         print(f"[Bilgi] Örnek rapor güncellendi: {sample_dest}")
 
-    issue_count = len(scan_results.issues)
+        meta_path = sample_dest.parent / "giskard_tarama_ozeti.json"
+        existing_meta: dict = {}
+        if meta_path.exists():
+            try:
+                existing_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                existing_meta = {}
+        existing_meta[target] = {
+            "scanned_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "target": target,
+            "target_model": cfg.gemini_model,
+            "giskard_evaluator_model": cfg.gemini_model,
+            "giskard_fallback_models": [cfg.gemini_fallback_model, "gemini-flash-lite-latest"],
+            "evaluator_family_note": (
+                "Soru üretici ve değerlendirici olarak Google Gemini model ailesi kullanılmıştır; "
+                "senaryolar yazar kurgusundan bağımsız sentezlense de hedef bot ile aynı model ailesini paylaşır."
+            ),
+            "detectors_tags": ["information_disclosure", "jailbreak"],
+            "num_requirements": num_requirements,
+            "num_samples_per_requirement": num_samples,
+            "injection_samples": injection_samples,
+            "configured_max_inputs": configured_max_inputs,
+            "actual_target_inputs_tested": predict_telemetry["total_inputs_tested"],
+            "predict_batches": predict_telemetry["batches"],
+            "raise_exceptions_enforced": True,
+            "detected_issues_count": issue_count,
+        }
+        meta_path.write_text(json.dumps(existing_meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
     print("\n" + "=" * 70)
-    print(f"TARAMA TAMAMLANDI - Tespit Edilen Bulgular: {issue_count}")
+    print(
+        f"TARAMA TAMAMLANDI - Denenen Girdi: {predict_telemetry['total_inputs_tested']} | "
+        f"Tespit Edilen Bulgular: {issue_count}"
+    )
     print(f"HTML Raporu: {report_path}")
     print("=" * 70)
     return report_path

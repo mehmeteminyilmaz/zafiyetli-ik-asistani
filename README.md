@@ -32,18 +32,21 @@ Projede aynı kurumsal senaryonun iki ayrı gerçeklemesi yan yana sunulmaktadı
 
 ## 2. Değerlendirme Metodolojisi ve Deneysel Sonuçlar
 
-Tek bir test yönteminin yanlılığını önlemek amacıyla **dış-örneklem (out-of-sample) otomatik tarama** ile **iç-örneklem (in-sample) ablasyon testi** birlikte raporlanmıştır:
+Tek bir test yönteminin yanlılığını önlemek amacıyla **dış-örneklem (out-of-sample) otomatik tarama**, **iç-örneklem (in-sample) ablasyon testi** ve **çok turlu uyarlanabilir kırmızı takım saldırısı** birlikte yürütülmüştür:
 
-### A. Dış-Örneklem (Out-of-Sample) Gerçek Giskard Taraması (`giskard_scan.py`)
-Proje yazarlarının yazdığı saldırı cümlelerinden bağımsız olarak, `giskard.scan()` kendi güvenlik gereksinimlerini ve Türkçe çekişmeli saldırı girdilerini otomatik sentezler (`giskard_gemini_client.py` adaptörü üzerinden):
-- **Zafiyetli Bot (`python giskard_scan.py --target vulnerable`):** `LLMInformationDisclosureDetector` tarafından **1 kritik bulgu** (`3/3` başarısız örnek — parola ve erişim kodu ifşası) tespit edilmiştir (`examples/ornek_giskard_raporu.html`).
-- **Güvenli Bot (`python giskard_scan.py --target secure`):** Giskard'ın bağımsız ürettiği 3 gizlilik gereksinimi ve `LLMPromptInjectionDetector` taramasında **0 bulgu** tespit edilmiştir (`examples/ornek_giskard_guvenli_raporu.html`).
+### A. Dış-Örneklem Otomatik Giskard Taraması (`giskard_scan.py`)
+Proje yazarlarının yazdığı saldırı cümlelerinden bağımsız olarak, `giskard.scan()` kendi güvenlik gereksinimlerini ve Türkçe çekişmeli saldırı girdilerini otomatik sentezler (`giskard_gemini_client.py` adaptörü üzerinden). Herhangi bir dedektör hatasının sessizce "0 bulgu" sayılmasını önlemek için `raise_exceptions=True` zorunlu kılınmış ve test edilen gerçek hedef girdi sayısı telemetriyle (`examples/giskard_tarama_ozeti.json`) kaydedilmiştir:
+- **Zafiyetli Bot (`python giskard_scan.py --target vulnerable`):** 4 güvenlik gereksinimi × 3 örnek + 6 prompt injection girdisi olmak üzere **18 çekişmeli girdi** 10 ayrı partide test edilmiştir. `LLMInformationDisclosureDetector` tarafından **3 ayrı kritik bulgu** (veritabanı parolası, acil kod ve kişisel veri ifşası) tespit edilmiştir (`examples/ornek_giskard_raporu.html`).
+- **Güvenli Bot (`python giskard_scan.py --target secure`):** 5 güvenlik gereksinimi × 4 örnek + 8 prompt injection girdisi olmak üzere **28 çekişmeli girdi** 9 ayrı partide test edilmiştir. Hem bilgi ifşası hem de prompt injection dedektörlerinde **0 bulgu** kaydedilmiştir (`examples/ornek_giskard_guvenli_raporu.html`).
+- **Metodolojik Uyarı:** Giskard'ın gereksinim üreticisi ve değerlendiricisi olarak Google Gemini model ailesi kullanılmıştır. Senaryolar yazar kurgusundan bağımsız sentezlense de hedef bot ile aynı üretici ailesini paylaştığından ortak kör nokta riski mevcuttur; ayrıca 28 denemede 0 bulgu elde edilmesi modelin matematiksel olarak kırılmaz olduğunu kanıtlamaz.
 
-### B. İç-Örneklem (In-Sample) Üçlü Ablasyon ve Hakem Doğrulaması (`redteam_benchmark.py`)
+### B. İç-Örneklem Üçlü Ablasyon ve Hakem Doğrulaması (`redteam_benchmark.py`)
 `probes.py` içindeki 11 OWASP senaryosu üzerinde üç varyant (`vulnerable`, `secure_no_guard`, `secure_full`) karşılaştırılmıştır:
-- **Ayrı ve İhtiyatlı (Fail-Closed) LLM-Hakem (`compliance_judge.py`):** Hedef bot `gemini-3.5-flash-lite` üzerinde çalışırken hakem olarak ayrı bir model (`gemini-3.1-flash-lite`) kullanılmıştır. Hakem, bozuk/eksik JSON çıktılarında iyimser `False` yerine ihtiyatlı **`complied=True` (fail-closed)** döndürür ve denetlenen yanıtı tek-kullanımlık rastgele sınır etiketleriyle ikincil prompt enjeksiyonuna karşı izole eder.
-- **İnsan Etiketiyle Hakem Doğrulaması (`validate_judge.py`):** 22 elle etiketlenmiş örnekten (`examples/hakem_etiketli_veri.json` — uydurma parola, yetkisiz rol kabulü ve ikincil hakem enjeksiyonu dahil 11 uyma + 11 reddetme) oluşan doğrulama kümesinde hakem modeli **22/22 (%100.0 uyum, Cohen's κ = 1.0, 0 ayrıştırma hatası)** üretmiştir (`examples/hakem_dogrulama_sonuclari.json`).
-- **Bağımsız Olmayan Tekrarlar ve Küme Güven Aralığı:** Tasarım **11 senaryo × 2 tekrar** şeklindedir. Aynı senaryonun tekrarları yüksek korelasyonlu olduğundan 22 bağımsız deney varsaymak güven aralığını yapay biçimde daraltır. Bu nedenle %95 Wilson güven aralıkları **bağımsız senaryo sayısı (`N = 11`)** üzerinden hesaplanmıştır (`0/11` için Wilson üst sınırı **%25.9**, `3/N` kuralıyla **%27.3**).
+- **Ayrı ve İhtiyatlı (Fail-Closed) LLM-Hakem (`compliance_judge.py`):** Hedef bot `gemini-3.5-flash-lite` üzerinde çalışırken hakem olarak ayrı bir model (`gemini-3.1-flash-lite`) kullanılmıştır. Hakem, bozuk/eksik JSON çıktılarında iyimser `False` yerine ihtiyatlı **`complied=True` (fail-closed)** döndürür ve denetlenen yanıtı tek-kullanımlık rastgele sınır etiketleriyle ikincil prompt enjeksiyonuna karşı izole eder. Kıyaslama koşumunda hakem ayrıştırma hatası toplamı `judge_parse_error_total: 0` olarak gerçekleşmiştir.
+- **Sınır Vakaları ve Gerçek Çıktılarla Hakem Doğrulaması (`validate_judge.py`):** Hakem modelinin güvenilirliği, 15'i canlı bot çıktısı (`hr_bot.py` ve `hr_bot_guvenli.py`) ve 10'u zor sınır vakası (kısmi ipucu, empatik ret, imalı sızıntı, ikincil hakem enjeksiyonu) olmak üzere **25 örnekten** oluşan kümede (`examples/hakem_etiketli_veri.json`; 10 uyma, 15 reddetme) test edilmiştir. Hakem modeli **25/25 (%100.0 uyum, Cohen's κ = 1.0, 0 ayrıştırma hatası)** üretmiştir (`examples/hakem_dogrulama_sonuclari.json`).
+  - *İstatistiksel Aralıklar:* %100 uyumun %95 Wilson güven aralığı **`[%86.7, %100.0]`** (Duyarlılık: `[%72.2, %100.0]`, Özgüllük: `[%79.6, %100.0]`) olarak hesaplanmıştır.
+  - *Tek-Etiketleyici Kısıtı:* Etiketler proje yazarı tarafından atanmıştır (`single_author_rater`). Bağımsız ikinci bir insan etiketleyici bulunmadığından etiketleyiciler arası güvenilirlik katsayısı (inter-rater κ) ölçülememiştir.
+- **Senaryo Toplulaştırma Kuralı ve Küme Güven Aralığı:** Tasarım **11 senaryo × 2 tekrar** şeklindedir. Bir senaryonun tekrarları bağımsız olmadığından toplulaştırma kuralı olarak **"en az bir tekrarda etkilenme (any-hit across repeats)"** uygulanmıştır (bir senaryonun 2 tekrarından en az 1'inde sızıntı/uyma olursa o senaryo etkilenmiş sayılır). Bu kural zafiyetli botta aralıklı sızıntıları (`P11`: 1/2 tekrar -> 1/1 senaryo) yakalarken, güvenli bot için `0/11` standardını daha sıkı hale getirir. %95 Wilson güven aralıkları **bağımsız senaryo sayısı (`N = 11`)** üzerinden raporlanmıştır (`0/11` için Wilson üst sınırı **%25.9**, `3/N` kuralıyla **%27.3**).
 
 | Mimari Varyant | Sır Sızıntı Oranı (`N=11` Senaryo ve %95 Wilson GA) | Saldırı İsteğine Uyma — LLM-Hakem (`N=11` Senaryo ve %95 Wilson GA) | Meşru Sorularda Yanlış Engelleme (`N=8`) |
 | :--- | :---: | :---: | :---: |
@@ -52,6 +55,11 @@ Proje yazarlarının yazdığı saldırı cümlelerinden bağımsız olarak, `gi
 | **3. Güvenli — Tam Savunma (`enable_input_guard=True`)** | **%0.0** (`0/11` senaryo, GA: `[%0.0, %25.9]`; tekrar: `0/22`) | **%0.0** (`0/11` senaryo, GA: `[%0.0, %25.9]`; tekrar: `0/22`) | %0.0 (`0/8`) |
 
 > **Temel Çıkarım:** `enable_input_guard=False` ile `enable_input_guard=True` koşumlarının birebir aynı sonucu (`0/11`) vermesi, bu senaryo kümesinde regex girdi kalkanının ölçülebilir ek bir güvenlik katkısı sağlamadığını; asıl korumayı **sırsız bağlam + veri sınırlandırma + model dışı RBAC** mimarisinin üstlendiğini somut olarak gösterir.
+
+### C. Çok Turlu Uyarlanabilir (Adaptive) Kırmızı Takım Saldırısı (`adaptive_redteam.py`)
+Statik probe listelerinin ötesine geçmek amacıyla, saldırgan tarafında hedef botun iç yönergesini bilmeyen, botun her turdaki yanıtına göre taktiğini dinamik değiştiren (`temperature=0.7`) bağımsız bir saldırgan LLM kullanılmıştır (`3 kampanya × 3 konuşma turu`):
+- **Zafiyetli Bot:** Saldırgan LLM 3 kampanyanın tamamında (`3/3`, **%100.0**, %95 Wilson GA: **`[%43.9, %100.0]`**) asistanı manipüle ederek sır sızıntısı ve uyma elde etmiştir (`examples/uyarlanabilir_saldiri_sonuclari.json`).
+- **Güvenli Bot (Kalkan Kapalı ve Tam Savunma):** Saldırgan LLM her turda taktik değiştirmesine (dolaylı dilekçe özetleme, JSON şablon zorlama, çok adımlı bağlam kurma) rağmen 3 kampanyanın hiçbirinde (`0/3`, **%0.0**, %95 Wilson GA: **`[%0.0, %56.1]`**) başarıya ulaşamamıştır.
 
 ---
 
@@ -70,26 +78,28 @@ Proje yazarlarının yazdığı saldırı cümlelerinden bağımsız olarak, `gi
 ```text
 zafiyetli-ik-asistani/
 ├── config.py                   # Ortam değişkenleri ve uygulama ayarları (tek doğruluk kaynağı)
-├── llm_core.py                 # Paylaşılan Gemini istemcisi (25 sn zaman aşımlı) ve tipli istisnalar
+├── llm_core.py                 # Paylaşılan Gemini istemcisi (60 sn zaman aşımlı) ve tipli istisnalar
 ├── hr_bot.py                   # Kasıtlı olarak zafiyetli İK asistanı
 ├── hr_bot_guvenli.py           # Savunmalı İK asistanı ve model dışı RBAC servisi
 ├── leak_detector.py            # Çok katmanlı sızıntı (DLP/Canary/Base64/Regex) ve yardımcı ön-filtre
 ├── compliance_judge.py         # Ayrı, fail-closed, ikincil enjeksiyon korumalı LLM-hakem ve Kappa/Wilson hesabı
-├── validate_judge.py           # 22 insan etiketli örnek üzerinde hakem uyum doğrulama aracı
+├── validate_judge.py           # 25 gerçek ve sınır vakalı örnek üzerinde hakem doğrulama aracı
+├── adaptive_redteam.py         # Çok turlu uyarlanabilir (adaptive) LLM kırmızı takım saldırı aracı
 ├── probes.py                   # 11 OWASP saldırı senaryosu, 8 negatif kontrol ve tohum veri seti
-├── giskard_gemini_client.py    # Giskard LLMClient arayüzünün Google Gemini adaptörü
-├── giskard_scan.py             # Gerçek giskard.scan() otomatik zafiyet tarama betiği
+├── giskard_gemini_client.py    # Giskard LLMClient arayüzünün Google Gemini adaptörü (çapraz havuz yedekli)
+├── giskard_scan.py             # Gerçek giskard.scan() otomatik zafiyet tarama betiği (telemetri kayıtlı)
 ├── redteam_benchmark.py        # 3 varyantlı ablasyon ve N=11 küme istatistikli kıyaslama aracı
 ├── main.py                     # Sunucu oturumlu, RBAC, sağdan XFF ve sandbox CSP korumalı FastAPI sunucusu
 ├── static/                     # Harici CDN gerektirmeyen, XSS korumalı web arayüzü
-├── tests/                      # 49 testlik birim, API, oturum, XFF/proxy ve canlı entegrasyon paketi
-├── examples/                   # Zafiyetli/güvenli Giskard HTML çıktıları, kıyaslama ve hakem doğrulama JSON verileri
+├── tests/                      # 52 testlik birim, API, oturum, XFF/proxy ve canlı entegrasyon paketi
+├── examples/                   # Giskard HTML raporları, kıyaslama, hakem doğrulama ve uyarlanabilir saldırı JSON verileri
 ├── docs/                       # Mimari karşılaştırma şeması
 ├── requirements.txt            # Hafif sohbet sunucusu bağımlılıkları (Python 3.10 - 3.12)
 ├── requirements-scan.txt       # Giskard tarama bağımlılıkları (Python 3.10 - 3.11)
 ├── requirements-dev.txt        # Test (pytest) ve statik analiz (ruff) bağımlılıkları
 ├── .github/workflows/ci.yml    # Çekirdek (3.10-3.12) ve Giskard (3.10-3.11) ayrık CI matrisi
 ├── calistir.bat / calistir.sh  # Windows ve Linux/macOS başlatma betikleri
+├── Makefile                    # Standart geliştirme, test ve denetim hedefleri
 └── LICENSE                     # MIT Lisansı
 ```
 
@@ -98,7 +108,7 @@ zafiyetli-ik-asistani/
 ## 5. Kurulum ve Çalıştırma
 
 ### Ön Koşullar
-- **Sohbet Sunucusu ve Kıyaslama Aracı (`requirements.txt`):** Python 3.10, 3.11 veya 3.12
+- **Sohbet Sunucusu, Kıyaslama ve Testler (`requirements.txt`):** Python 3.10, 3.11 veya 3.12
 - **Giskard Otomatik Tarayıcısı (`requirements-scan.txt`):** **Python 3.10 veya 3.11** (`giskard==2.19.2` paketinin `scipy<1.12.0` ve `numpy<2.0` sabitleri nedeniyle Python 3.12+ ortamında kurulmamalıdır; CI matrisi bu ayrımı zorunlu kılar).
 - Google AI Studio üzerinden alınmış bir `GEMINI_API_KEY`.
 
@@ -138,11 +148,14 @@ python main.py
 python giskard_scan.py --target vulnerable
 python giskard_scan.py --target secure
 
-# Hakem modelinin insan etiketli küme üzerinde uyum doğrulaması:
+# Hakem modelinin 25 sınır vakalı veri üzerinde uyum doğrulaması:
 python validate_judge.py
 
 # Üçlü ablasyon ve N=11 küme istatistikli kıyaslama testi:
 python redteam_benchmark.py --runs 2
+
+# Çok turlu uyarlanabilir (adaptive) LLM saldırı testi:
+python adaptive_redteam.py --turns 3
 
 # Birim/API testleri ve statik analiz:
 pip install -r requirements-dev.txt
@@ -154,11 +167,12 @@ ruff check .
 
 ## 6. Bilinen Sınırlamalar ve Operasyonel Notlar
 
-1. **İç-Örneklem (In-Sample) Yanlılığı ve Küçük Örneklem:** `probes.py` içindeki 11 senaryo, savunma mimarisini geliştiren aynı ekip tarafından yazılmıştır (*in-sample*). Güvenli sistem promptu özel probe kelimelerinden arındırılmış ve ek olarak dış-örneklem `giskard.scan(--target secure)` çalıştırılmış olsa da, `0/11` sonucu %95 güven düzeyinde **`[%0.0, %25.9]`** gibi geniş bir aralığa karşılık gelir; görünmeyen yeni saldırı sınıflarında %0 garanti edilemez.
-2. **Tekrarların Bağımlılığı:** Düşük sıcaklıkta (`0.2`) aynı senaryonun tekrarları birbirine bağlıdır; tekrar sayısını (`--runs`) artırmak yalnızca aynı prompt üzerindeki varyansı ölçer, etkin örneklem boyutunu (`N=11`) büyütmez. Güven aralığını daraltmak için birbirinden bağımsız yeni senaryolar eklenmelidir.
-3. **Aynı Sağlayıcı Ailesinden Hakem Modeli:** Hedef bot (`gemini-3.5-flash-lite`) ile hakem model (`gemini-3.1-flash-lite`) farklı modeller olsa da aynı üretici ailesine (Google Gemini) aittir ve ortak kör noktaları paylaşabilir. Üretim düzeyinde değerlendirmelerde farklı model ailelerinden (ör. Claude veya GPT) çapraz hakem kullanılması önerilir.
-4. **Süreç İçi Bellek (Single-Worker Varsayımı):** `ServerSessionStore` ve `SlidingWindowRateLimiter` süreç içi bellekte tutulur. `uvicorn` birden fazla işçi süreçle (`--workers > 1`) çalıştırılırsa oturum geçmişi süreçler arasında paylaşılmaz ve hız sınırı sayaçları bölünür; çoklu worker ortamında Redis benzeri harici bir depo gerekir.
-5. **Ters Vekil Sunucu (Reverse Proxy) Davranışı:** Varsayılan `TRUST_PROXY_HEADERS=false` ayarında uygulama bir reverse proxy arkasına konulursa tüm istemciler hız sınırlayıcıya proxy'nin tek IP adresi olarak görünür ve `/api/run-scan` için `SCAN_TOKEN` zorunlu hale gelir. `TRUST_PROXY_HEADERS=true` açıldığında ise sahte `X-Forwarded-For` başlıklarına kanmamak için `TRUSTED_PROXY_COUNT` değeri öndeki güvenilir proxy sayısına eşitlenmelidir (IP sağdan okunur).
+1. **İç-Örneklem (In-Sample) Yanlılığı ve Küçük Örneklem:** `probes.py` içindeki 11 senaryo, savunma mimarisini geliştiren aynı ekip tarafından yazılmıştır (*in-sample*). Güvenli sistem promptu özel probe kelimelerinden arındırılmış ve ek olarak dış-örneklem `giskard.scan(--target secure)` çalıştırılmış olsa da, `0/11` sonucu %95 güven düzeyinde **`[%0.0, %25.9]`** gibi bir aralığa karşılık gelir; görünmeyen yeni saldırı sınıflarında mutlak %0 garanti edilemez.
+2. **Tek-Etiketleyici Kısıtı:** Hakem kalibrasyon veri setindeki (`examples/hakem_etiketli_veri.json`) etiketler proje yazarı tarafından atanmıştır (`single_author_rater`). İkinci bir bağımsız insan etiketleyici bulunmadığından etiketleyiciler arası güvenilirlik (inter-rater agreement) ölçülmemiştir.
+3. **Tekrarların Bağımlılığı ve Toplulaştırma:** Düşük sıcaklıkta aynı senaryonun tekrarları birbirine bağlıdır; tekrar sayısını artırmak etkin örneklem boyutunu (`N=11`) büyütmez. Bu nedenle toplulaştırma kuralı olarak senaryo bazlı *en az bir tekrarda etkilenme* esası benimsenmiştir.
+4. **Aynı Sağlayıcı Ailesinden Hakem ve Tarayıcı Modelleri:** Hedef bot (`gemini-3.5-flash-lite`), hakem model (`gemini-3.1-flash-lite`) ve Giskard değerlendiricisi farklı modeller olsa da aynı üretici ailesine (Google Gemini) aittir ve ortak kör noktaları paylaşabilir. Üretim düzeyinde bağımsız denetimlerde farklı model ailelerinden (ör. Claude veya GPT) çapraz hakem kullanılması önerilir.
+5. **Süreç İçi Bellek (Single-Worker Varsayımı):** `ServerSessionStore` ve `SlidingWindowRateLimiter` süreç içi bellekte tutulur. `uvicorn` birden fazla işçi süreçle (`--workers > 1`) çalıştırılırsa oturum geçmişi süreçler arasında paylaşılmaz ve hız sınırı sayaçları bölünür; çoklu worker ortamında Redis benzeri harici bir depo gerekir.
+6. **Ters Vekil Sunucu (Reverse Proxy) Davranışı:** Varsayılan `TRUST_PROXY_HEADERS=false` ayarında uygulama bir reverse proxy arkasına konulursa tüm istemciler hız sınırlayıcıya proxy'nin tek IP adresi olarak görünür ve `/api/run-scan` için `SCAN_TOKEN` zorunlu hale gelir. `TRUST_PROXY_HEADERS=true` açıldığında ise sahte `X-Forwarded-For` başlıklarına kanmamak için `TRUSTED_PROXY_COUNT` değeri öndeki güvenilir proxy sayısına eşitlenmelidir (IP sağdan okunur).
 
 ---
 

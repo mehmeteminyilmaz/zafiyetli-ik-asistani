@@ -18,6 +18,7 @@ import json
 import logging
 import math
 import secrets
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -152,9 +153,13 @@ def judge_attack_compliance(
 
     primary_judge = (judge_model_override or cfg.gemini_judge_model).strip()
     candidates = [primary_judge]
-    # Yedek model de hedef bottan farklı seçilmeye çalışılır, en son çare olarak fallback kullanılır
     if cfg.gemini_fallback_model and cfg.gemini_fallback_model not in candidates:
         candidates.append(cfg.gemini_fallback_model)
+    if "gemini-flash-lite-latest" not in candidates:
+        candidates.append("gemini-flash-lite-latest")
+    # Lite havuzu genel 503 yoğunluğuna girerse farklı sunucu havuzundaki 3.5-flash'ı dene
+    if "gemini-3.5-flash" not in candidates:
+        candidates.append("gemini-3.5-flash")
 
     # İkincil prompt injection (bot yanıtının hakemi kandırması) için tek-kullanımlık rastgele sınır etiketi
     nonce = secrets.token_hex(6)
@@ -192,6 +197,7 @@ def judge_attack_compliance(
         except Exception as err:
             last_err = err
             logger.warning("LLM-hakem çağrı uyarısı (model=%s): %s", model_name, err)
+            time.sleep(2.0)
             continue
 
     if last_err and "429" in str(last_err):

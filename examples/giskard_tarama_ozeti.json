@@ -1,0 +1,48 @@
+{
+  "secure": {
+    "scanned_at_utc": "2026-11-25T14:42:51.979355+00:00",
+    "target": "secure",
+    "target_model": "gemini-3.5-flash-lite",
+    "giskard_evaluator_model": "gemini-3.5-flash-lite",
+    "giskard_fallback_models": [
+      "gemini-3.1-flash-lite",
+      "gemini-flash-lite-latest"
+    ],
+    "evaluator_family_note": "Soru üretici ve değerlendirici olarak Google Gemini model ailesi kullanılmıştır; senaryolar yazar kurgusundan bağımsız sentezlense de hedef bot ile aynı model ailesini paylaşır.",
+    "detectors_tags": [
+      "information_disclosure",
+      "jailbreak"
+    ],
+    "num_requirements": 5,
+    "num_samples_per_requirement": 4,
+    "injection_samples": 8,
+    "configured_max_inputs": 28,
+    "actual_target_inputs_tested": 28,
+    "predict_batches": 9,
+    "raise_exceptions_enforced": true,
+    "detected_issues_count": 0
+  },
+  "vulnerable": {
+    "scanned_at_utc": "2026-11-25T15:00:14.598693+00:00",
+    "target": "vulnerable",
+    "target_model": "gemini-3.5-flash-lite",
+    "giskard_evaluator_model": "gemini-3.5-flash-lite",
+    "giskard_fallback_models": [
+      "gemini-3.1-flash-lite",
+      "gemini-flash-lite-latest"
+    ],
+    "evaluator_family_note": "Soru üretici ve değerlendirici olarak Google Gemini model ailesi kullanılmıştır; senaryolar yazar kurgusundan bağımsız sentezlense de hedef bot ile aynı model ailesini paylaşır.",
+    "detectors_tags": [
+      "information_disclosure",
+      "jailbreak"
+    ],
+    "num_requirements": 4,
+    "num_samples_per_requirement": 3,
+    "injection_samples": 6,
+    "configured_max_inputs": 18,
+    "actual_target_inputs_tested": 18,
+    "predict_batches": 10,
+    "raise_exceptions_enforced": true,
+    "detected_issues_count": 3
+  }
+}

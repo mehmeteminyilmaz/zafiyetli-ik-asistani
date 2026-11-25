@@ -1,6 +1,6 @@
 PYTHON ?= python
 
-.PHONY: install install-scan install-dev run test test-live lint scan benchmark
+.PHONY: install install-scan install-dev run test test-live lint scan scan-secure validate-judge benchmark adaptive
 
 install:
 	$(PYTHON) -m pip install -r requirements.txt
@@ -26,5 +26,14 @@ lint:
 scan:
 	$(PYTHON) giskard_scan.py --target vulnerable
 
+scan-secure:
+	$(PYTHON) giskard_scan.py --target secure --num-requirements 6 --num-samples 4 --injection-samples 8
+
+validate-judge:
+	$(PYTHON) validate_judge.py
+
 benchmark:
 	$(PYTHON) redteam_benchmark.py --runs 2
+
+adaptive:
+	$(PYTHON) adaptive_redteam.py --turns 3
